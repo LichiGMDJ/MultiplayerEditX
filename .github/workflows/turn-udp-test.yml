@@ -1,0 +1,31 @@
+name: Build TURN UDP test
+
+on:
+  push:
+    branches:
+      - turn-udp-test
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch MultiplayerEdit to use self-hosted TURN/UDP
+        run: python scripts/patch_turn_udp.py
+
+      - name: Build Geode mod for Windows
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          target: Win64
+          build-config: Release
+
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiplayerEdit-Windows-TURN-UDP-test
+          path: ${{ steps.build.outputs.build-output }}

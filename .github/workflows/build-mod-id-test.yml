@@ -20,6 +20,7 @@ jobs:
           python -m py_compile scripts/patch_bulk_paste_sync.py
           python -m py_compile scripts/patch_bulk_transport_queue.py
           python -m py_compile scripts/patch_reliable_editor_retry.py
+          python -m py_compile scripts/patch_reliable_transport_queue.py
           python -m py_compile scripts/patch_processing_remote_guard.py
 
       - name: Apply 0.5.1 safety patch
@@ -36,6 +37,9 @@ jobs:
 
       - name: Apply reliable editor retry patch
         run: python scripts/patch_reliable_editor_retry.py
+
+      - name: Apply strict reliable FIFO patch
+        run: python scripts/patch_reliable_transport_queue.py
 
       - name: Apply remote-processing RAII guard
         run: python scripts/patch_processing_remote_guard.py
@@ -55,14 +59,18 @@ jobs:
           if (-not $p2p.Contains("kProtocolVersion = 1")) { throw "protocol version guard missing" }
           if (-not $p2p.Contains("serializeProtocolHello")) { throw "protocol hello send missing" }
           if (-not $p2p.Contains("replaying {} buffered packets")) { throw "pre-handshake replay logic missing" }
-          if (-not $p2p.Contains("flushBulkReliableQueues")) { throw "bulk queue drain missing" }
-          if (-not $p2p.Contains("bulk send deferred")) { throw "bulk retry path missing" }
-          if (-not $p2p.Contains("queued failed reliable opcode")) { throw "small reliable retry path missing" }
-          if (-not $p2pHeader.Contains("bulkReliableQueue")) { throw "bulk reliable queue state missing" }
+          if (-not $p2p.Contains("flushBulkReliableQueues")) { throw "reliable FIFO drain missing" }
+          if (-not $p2p.Contains("queued reliable editor opcode")) { throw "editor reliable FIFO enqueue missing" }
+          if (-not $p2p.Contains("reliable FIFO send deferred")) { throw "reliable FIFO retry path missing" }
+          if (-not $p2p.Contains("opcode == proto::Opcode::MoveObjects")) { throw "move packets are not in ordered FIFO" }
+          if (-not $p2p.Contains("opcode == proto::Opcode::PlaceObjects")) { throw "placement packets are not in ordered FIFO" }
+          if (-not $p2pHeader.Contains("bulkReliableQueue")) { throw "reliable FIFO state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
           if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
           if ($p2p.Contains("openrelay.metered.ca")) { throw "old public TURN relay still present after patch" }
+          if (-not $hooks.Contains("MAX_CHUNK_BYTES = 12000")) { throw "safe full-level sync chunk bytes missing" }
+          if (-not $hooks.Contains("MAX_UUIDS_PER_CHUNK = 250")) { throw "safe full-level UUID chunk size missing" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
           if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }
           if (-not $hooks.Contains("externally-created objects")) { throw "external placement reconciliation missing" }

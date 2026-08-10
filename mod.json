@@ -25,10 +25,38 @@
         "signaling-url": {
             "type": "string",
             "name": "Signaling Server URL",
-            "description": "URL of the signaling server used for connection setup. Only change this if you're self-hosting your own signaling server.",
-            "default": "https://dewy-flea-9364.d050.deno.net",
+            "description": "URL of the signaling server used for connection setup.",
+            "default": "https://194.226.126.115:8443",
             "max-length": 150,
             "filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.?&=-_"
+        },
+        "turn-section": {
+            "type": "title",
+            "name": "TURN Relay"
+        },
+        "turn-host": {
+            "type": "string",
+            "name": "TURN Host",
+            "description": "Hostname or IPv4 address of the TURN server. Port 3478/UDP is used by this build.",
+            "default": "194.226.126.115"
+        },
+        "turn-username": {
+            "type": "string",
+            "name": "TURN Username",
+            "description": "TURN long-term credential username.",
+            "default": "mpedit"
+        },
+        "turn-password": {
+            "type": "string",
+            "name": "TURN Password",
+            "description": "TURN password. Stored only in local Geode settings; do not publish it.",
+            "default": ""
+        },
+        "force-turn-relay": {
+            "type": "bool",
+            "name": "Force TURN Relay",
+            "description": "Force WebRTC ICE traffic through TURN for diagnostic testing.",
+            "default": true
         },
         "player-name": {
             "type": "string",

@@ -6,7 +6,6 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
         raise SystemExit(f"{label}: expected source block was not found; refusing to patch")
     return text.replace(old, new, 1)
 
-
 # Add an explicit bootstrap control message. Initial sync must not depend on the
 # timing of host-side onPlayerJoined callbacks.
 proto_hpp_path = Path("src/BinaryProtocol.hpp")
@@ -35,9 +34,6 @@ proto_cpp = replace_once(
 )
 proto_cpp_path.write_text(proto_cpp, encoding="utf-8")
 
-
-# Host answers the explicit bootstrap request with the authoritative chunked
-# sync. This handler exists before either side opens the editor scene.
 remote_cpp_path = Path("src/RemoteActionHandler.cpp")
 remote_cpp = remote_cpp_path.read_text(encoding="utf-8")
 remote_cpp = replace_once(
@@ -48,10 +44,6 @@ remote_cpp = replace_once(
 )
 remote_cpp_path.write_text(remote_cpp, encoding="utf-8")
 
-
-# Once the client has completed ProtocolHello, explicitly request the host
-# bootstrap level. Keep this as immediate control traffic; it must not wait on
-# editor FIFO.
 p2p_cpp_path = Path("src/P2PManager.cpp")
 p2p_cpp = p2p_cpp_path.read_text(encoding="utf-8")
 p2p_cpp = replace_once(
@@ -62,9 +54,6 @@ p2p_cpp = replace_once(
 )
 p2p_cpp_path.write_text(p2p_cpp, encoding="utf-8")
 
-
-# Remove push-based host sync on PlayerJoined. The request path above is the one
-# source of truth, preventing duplicate overlapping SyncLevel streams.
 hooks_path = Path("src/EditorHooks.cpp")
 hooks = hooks_path.read_text(encoding="utf-8")
 start = hooks.find('        SessionManager::get().onPlayerJoined([this](PlayerInfo const& info) {')
@@ -76,50 +65,29 @@ if brace == -1:
 depth = 0
 end = -1
 for i in range(brace, len(hooks)):
-    if hooks[i] == '{':
-        depth += 1
+    if hooks[i] == '{': depth += 1
     elif hooks[i] == '}':
         depth -= 1
         if depth == 0:
             semi = hooks.find(';', i)
-            if semi == -1:
-                raise SystemExit("initial sync callback: terminator not found; refusing to patch")
+            if semi == -1: raise SystemExit("initial sync callback: terminator not found; refusing to patch")
             end = semi + 1
             break
 if end == -1:
     raise SystemExit("initial sync callback: block end not found; refusing to patch")
-replacement = '''        // Initial level transfer is request-driven after ProtocolHello.\n        // This avoids a first-join race between peer callbacks and bootstrap sync.\n'''
-hooks = hooks[:start] + replacement + hooks[end:]
+hooks = hooks[:start] + '''        // Initial level transfer is request-driven after ProtocolHello.\n        // This avoids a first-join race between peer callbacks and bootstrap sync.\n''' + hooks[end:]
 hooks_path.write_text(hooks, encoding="utf-8")
-
 print("Patched first-join bootstrap to explicit InitialSyncRequest -> authoritative SyncLevel")
 
-bridge_patch = Path("scripts/patch_raw_bulk_anchor_bridge.py")
-if not bridge_patch.exists():
-    raise SystemExit("raw bulk anchor bridge patch missing")
-exec(compile(bridge_patch.read_text(encoding="utf-8"), str(bridge_patch), "exec"), {"__name__": "__main__"})
-
-raw_patch = Path("scripts/patch_raw_bulk_paste_v3.py")
-if not raw_patch.exists():
-    raise SystemExit("raw bulk paste v3 patch missing")
-exec(compile(raw_patch.read_text(encoding="utf-8"), str(raw_patch), "exec"), {"__name__": "__main__"})
-
-relay_bridge = Path("scripts/patch_v4_relay_anchor_bridge.py")
-if not relay_bridge.exists():
-    raise SystemExit("v4 relay anchor bridge patch missing")
-exec(compile(relay_bridge.read_text(encoding="utf-8"), str(relay_bridge), "exec"), {"__name__": "__main__"})
-
-v4_patch = Path("scripts/patch_global_shared_state_v4.py")
-if not v4_patch.exists():
-    raise SystemExit("global shared state v4 patch missing")
-exec(compile(v4_patch.read_text(encoding="utf-8"), str(v4_patch), "exec"), {"__name__": "__main__"})
-
-v5_patch = Path("scripts/patch_workshop_anchor_host_music_v5.py")
-if not v5_patch.exists():
-    raise SystemExit("Object Workshop anchor / host music v5 patch missing")
-exec(compile(v5_patch.read_text(encoding="utf-8"), str(v5_patch), "exec"), {"__name__": "__main__"})
-
-finalize_patch = Path("scripts/patch_finalize_release.py")
-if not finalize_patch.exists():
-    raise SystemExit("final release verification patch missing")
-exec(compile(finalize_patch.read_text(encoding="utf-8"), str(finalize_patch), "exec"), {"__name__": "__main__"})
+for script, missing in [
+    ("scripts/patch_raw_bulk_anchor_bridge.py", "raw bulk anchor bridge patch missing"),
+    ("scripts/patch_raw_bulk_paste_v3.py", "raw bulk paste v3 patch missing"),
+    ("scripts/patch_v4_relay_anchor_bridge.py", "v4 relay anchor bridge patch missing"),
+    ("scripts/patch_global_shared_state_v4.py", "global shared state v4 patch missing"),
+    ("scripts/patch_workshop_anchor_host_music_v5.py", "Object Workshop anchor / host music v5 patch missing"),
+    ("scripts/patch_room_settings_v6.py", "Room Settings v6 patch missing"),
+    ("scripts/patch_finalize_release.py", "final release verification patch missing"),
+]:
+    path = Path(script)
+    if not path.exists(): raise SystemExit(missing)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), {"__name__": "__main__"})

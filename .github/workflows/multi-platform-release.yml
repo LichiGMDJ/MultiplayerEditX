@@ -8,6 +8,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.config.name }}
@@ -122,3 +125,11 @@ jobs:
         with:
           name: lichigmdj.multiplayereditx-0.5.1-multiplatform
           path: ${{ steps.combine.outputs.build-output }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Multiplayer Edit v0.5.1
+          generate_release_notes: true
+          files: ${{ steps.combine.outputs.build-output }}

@@ -114,6 +114,11 @@ if not v4_patch.exists():
     raise SystemExit("global shared state v4 patch missing")
 exec(compile(v4_patch.read_text(encoding="utf-8"), str(v4_patch), "exec"), {"__name__": "__main__"})
 
+v5_patch = Path("scripts/patch_workshop_anchor_host_music_v5.py")
+if not v5_patch.exists():
+    raise SystemExit("Object Workshop anchor / host music v5 patch missing")
+exec(compile(v5_patch.read_text(encoding="utf-8"), str(v5_patch), "exec"), {"__name__": "__main__"})
+
 finalize_patch = Path("scripts/patch_finalize_release.py")
 if not finalize_patch.exists():
     raise SystemExit("final release verification patch missing")

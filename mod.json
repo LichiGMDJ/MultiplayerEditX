@@ -8,11 +8,11 @@
     },
     "id": "lichigmdj.multiplayereditx",
     "name": "Multiplayer Edit",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "developer": "LichiGMDJ",
     "description": "Fork of Multiplayer Edit by xXoanon. Collaborate with friends in real-time level editing, host a session, and build together.",
     "links": {
-        "source": "https://github.com/LichiGMDJ/MultiplayerEdit"
+        "source": "https://github.com/LichiGMDJ/MultiplayerEditX"
     },
     "tags": [
         "editor",
@@ -30,7 +30,6 @@
             "name": "Signaling Server URL",
             "description": "URL of the signaling server used for connection setup.",
             "default": "https://194.226.126.115:8443",
-            "max-length": 150,
             "filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.?&=-_"
         },
         "turn-section": {
@@ -52,14 +51,14 @@
         "turn-password": {
             "type": "string",
             "name": "TURN Password",
-            "description": "TURN password. Stored only in local Geode settings; do not publish it.",
+            "description": "TURN password for this client. Kept in local Geode settings and never embedded into release builds.",
             "default": ""
         },
         "force-turn-relay": {
             "type": "bool",
             "name": "Force TURN Relay",
-            "description": "Force WebRTC ICE traffic through TURN for diagnostic testing.",
-            "default": true
+            "description": "Force WebRTC ICE traffic through TURN for diagnostic testing. Requires a TURN password.",
+            "default": false
         },
         "player-name": {
             "type": "string",

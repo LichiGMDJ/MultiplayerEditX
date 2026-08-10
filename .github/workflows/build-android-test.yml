@@ -1,0 +1,87 @@
+name: Build Android64 Test
+
+on:
+  push:
+    branches:
+      - mod-id-lichigmdj
+  workflow_dispatch:
+
+jobs:
+  build-android64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate patch scripts
+        run: |
+          python -m py_compile scripts/patch_turn_udp.py
+          python -m py_compile scripts/patch_external_editor_sync.py
+          python -m py_compile scripts/patch_bulk_paste_sync.py
+          python -m py_compile scripts/patch_bulk_transport_queue.py
+          python -m py_compile scripts/patch_reliable_editor_retry.py
+          python -m py_compile scripts/patch_reliable_transport_queue.py
+          python -m py_compile scripts/patch_processing_remote_guard.py
+          python -m py_compile scripts/patch_ack_integrity_reconnect.py
+          python -m py_compile scripts/patch_ack_integrity_reconnect_hardening.py
+          python -m py_compile scripts/patch_integrity_compile_fix.py
+          python -m py_compile scripts/patch_handshake_finalize.py
+          python -m py_compile scripts/patch_initial_sync_always_full.py
+          python -m py_compile scripts/patch_initial_sync_request.py
+          python -m py_compile scripts/patch_raw_bulk_anchor_bridge.py
+          python -m py_compile scripts/patch_raw_bulk_paste_v3.py
+          python -m py_compile scripts/patch_v4_relay_anchor_bridge.py
+          python -m py_compile scripts/patch_global_shared_state_v4.py
+          python -m py_compile scripts/patch_workshop_anchor_host_music_v5.py
+          python -m py_compile scripts/patch_room_settings_v6.py
+          python -m py_compile scripts/patch_room_settings_layout.py
+          python -m py_compile scripts/patch_finalize_release.py
+
+      - name: Apply base transport patch chain
+        run: |
+          python scripts/patch_turn_udp.py
+          python scripts/patch_external_editor_sync.py
+          python scripts/patch_bulk_paste_sync.py
+          python scripts/patch_bulk_transport_queue.py
+          python scripts/patch_reliable_editor_retry.py
+          python scripts/patch_reliable_transport_queue.py
+          python scripts/patch_processing_remote_guard.py
+          python scripts/patch_ack_integrity_reconnect.py
+          python scripts/patch_ack_integrity_reconnect_hardening.py
+          python scripts/patch_integrity_compile_fix.py
+          python scripts/patch_handshake_finalize.py
+          python scripts/patch_initial_sync_always_full.py
+
+      - name: Apply Protocol v6 feature chain
+        run: python scripts/patch_initial_sync_request.py
+
+      - name: Verify Android metadata and final protocol
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          mod = json.loads(Path('mod.json').read_text(encoding='utf-8'))
+          assert mod.get('gd', {}).get('android') == '2.2081', 'Android GD target missing'
+          p2p = Path('src/P2PManager.cpp').read_text(encoding='utf-8')
+          proto = Path('src/BinaryProtocol.hpp').read_text(encoding='utf-8')
+          assert 'kProtocolVersion = 6' in p2p, 'Protocol v6 missing'
+          assert 'RoomSettingsChanged' in proto, 'Room Settings protocol missing'
+          print('Android pre-build verification passed')
+          PY
+
+      - name: Build Android64 Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: 5.7.1
+          target: Android64
+          build-config: Release
+          android-min-sdk: 23
+          configure-args: -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          export-symbols: true
+
+      - name: Upload Android64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichigmdj.multiplayereditx-0.5.1-android64-test
+          path: ${{ steps.build.outputs.build-output }}

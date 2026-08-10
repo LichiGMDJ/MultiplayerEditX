@@ -13,11 +13,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate safety patch script
-        run: python -m py_compile scripts/patch_turn_udp.py
+      - name: Validate patch scripts
+        run: |
+          python -m py_compile scripts/patch_turn_udp.py
+          python -m py_compile scripts/patch_external_editor_sync.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
+
+      - name: Apply external editor compatibility patch
+        run: python scripts/patch_external_editor_sync.py
 
       - name: Verify patched source markers
         shell: pwsh
@@ -38,6 +43,9 @@ jobs:
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
           if ($p2p.Contains("openrelay.metered.ca")) { throw "old public TURN relay still present after patch" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
+          if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }
+          if (-not $hooks.Contains("externally-created objects")) { throw "external placement reconciliation missing" }
+          if (-not $hooks.Contains("externally-deleted objects")) { throw "external deletion reconciliation missing" }
           if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }
           if (-not $cursor.Contains("LevelTools::getAudioTitle")) { throw "official song title lookup missing" }
 

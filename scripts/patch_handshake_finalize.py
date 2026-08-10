@@ -34,8 +34,6 @@ hpp_path.write_text(hpp, encoding="utf-8")
 cpp_path = Path("src/P2PManager.cpp")
 cpp = cpp_path.read_text(encoding="utf-8")
 
-# Protocol verification is the actual session-ready boundary. Finalize callbacks
-# only after the remote hello has been accepted.
 cpp = replace_once(
     cpp,
     '''            log::info(
@@ -90,7 +88,6 @@ new_functions = '''    void P2PManager::finalizePeerHandshake(int playerId) {
             pending.size()
         );
 
-        // Release packets only after protocol compatibility is known.
         for (auto& msg : pending) {
             sendTo(pid, msg.data, msg.channel);
         }
@@ -150,27 +147,44 @@ new_functions = '''    void P2PManager::finalizePeerHandshake(int playerId) {
 
         if (!becameTransportReady) return;
 
-        // Hello is deliberately immediate/control traffic and is never put into
-        // the editor reliable FIFO. The peer is not announced yet.
         auto hello = proto::serializeProtocolHello(kProtocolVersion);
         sendTo(pid, hello, ChannelType::Reliable);
     }
-
-
 '''
 
-# Previous reliability/reconnect patches legitimately edit checkPeerReady(), so
-# do not require an exact copy of its body. Replace the function by its stable
-# declaration boundary instead. This still refuses to patch if either boundary
-# is missing or appears in an unexpected order.
+# Replace only checkPeerReady() itself. Do not use the next function as an end
+# marker: the ACK/reconnect layer intentionally inserts scheduleClientReconnect()
+# between checkPeerReady() and leaveSession(). A range replacement would delete
+# that scheduler and cause an undefined-symbol linker failure.
 start_marker = "    void P2PManager::checkPeerReady(int playerId) {"
-end_marker = "    void P2PManager::leaveSession() {"
 start = cpp.find(start_marker)
-end = cpp.find(end_marker, start + len(start_marker)) if start != -1 else -1
-if start == -1 or end == -1 or end <= start:
-    raise SystemExit("protocol-gated peer finalization: checkPeerReady/leaveSession boundaries not found; refusing to patch")
+if start == -1:
+    raise SystemExit("protocol-gated peer finalization: checkPeerReady start not found; refusing to patch")
+
+open_brace = cpp.find("{", start)
+if open_brace == -1:
+    raise SystemExit("protocol-gated peer finalization: checkPeerReady opening brace not found; refusing to patch")
+
+depth = 0
+end = -1
+for i in range(open_brace, len(cpp)):
+    ch = cpp[i]
+    if ch == "{":
+        depth += 1
+    elif ch == "}":
+        depth -= 1
+        if depth == 0:
+            end = i + 1
+            break
+
+if end == -1:
+    raise SystemExit("protocol-gated peer finalization: checkPeerReady closing brace not found; refusing to patch")
 
 cpp = cpp[:start] + new_functions + cpp[end:]
 
+# Guard against accidentally deleting the reconnect scheduler again.
+if "void P2PManager::scheduleClientReconnect()" not in cpp:
+    raise SystemExit("protocol-gated peer finalization: reconnect scheduler disappeared; refusing to write patched source")
+
 cpp_path.write_text(cpp, encoding="utf-8")
-print("Patched transport-ready vs protocol-ready state machine")
+print("Patched transport-ready vs protocol-ready state machine while preserving reconnect scheduler")

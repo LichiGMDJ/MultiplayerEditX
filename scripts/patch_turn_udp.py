@@ -12,21 +12,33 @@ text = path.read_text(encoding="utf-8")
 
 old = '''        rtc::IceServer turn("openrelay.metered.ca", 443, "openrelayproject", "openrelayproject", rtc::IceServer::RelayType::TurnTcp);\n        config.iceServers.push_back(turn);'''
 
-new = f'''        // Self-hosted TURN/UDP credentials are injected only during CI build.
-        // The password is not stored in the repository.
+new = f'''        auto turnHost = Mod::get()->getSettingValue<std::string>("turn-host");
+        auto turnUsername = Mod::get()->getSettingValue<std::string>("turn-username");
+        auto turnPassword = Mod::get()->getSettingValue<std::string>("turn-password");
+        auto forceTurnRelay = Mod::get()->getSettingValue<bool>("force-turn-relay");
+
+        if (turnHost.empty()) turnHost = "194.226.126.115";
+        if (turnUsername.empty()) turnUsername = "mpedit";
+        if (turnPassword.empty()) turnPassword = "{turn_password_cpp}";
+
         rtc::IceServer turn(
-            "194.226.126.115",
+            turnHost,
             3478,
-            "mpedit",
-            "{turn_password_cpp}",
+            turnUsername,
+            turnPassword,
             rtc::IceServer::RelayType::TurnUdp
         );
         config.iceServers.push_back(turn);
-        config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+
+        if (forceTurnRelay) {{
+            config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+        }}
 
         log::info(
-            "P2PManager: TURN/UDP configured at 194.226.126.115:3478 (forceRelay=true, passwordLen={{}})",
-            std::string("{turn_password_cpp}").size()
+            "P2PManager: TURN/UDP configured at {{}}:3478 (forceRelay={{}}, passwordLen={{}})",
+            turnHost,
+            forceTurnRelay,
+            turnPassword.size()
         );'''
 
 if old not in text:
@@ -40,4 +52,4 @@ text = text.replace(
 )
 
 path.write_text(text, encoding="utf-8")
-print("Patched P2PManager.cpp for self-hosted signaling and TURN/UDP relay")
+print("Patched P2PManager.cpp for self-hosted signaling and configurable TURN/UDP relay")

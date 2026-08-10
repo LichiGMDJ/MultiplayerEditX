@@ -23,14 +23,21 @@ jobs:
         shell: pwsh
         run: |
           $p2p = Get-Content src/P2PManager.cpp -Raw
+          $p2pHeader = Get-Content src/P2PManager.hpp -Raw
+          $protoHeader = Get-Content src/BinaryProtocol.hpp -Raw
           $hooks = Get-Content src/EditorHooks.cpp -Raw
           $cursor = Get-Content src/ui/CursorNode.cpp -Raw
 
           if (-not $p2p.Contains("kSafeMessageBytes")) { throw "safe SCTP message guard missing" }
           if (-not $p2p.Contains("kMaxInboundMessageBytes")) { throw "inbound packet guard missing" }
-          if (-not $p2p.Contains("local-only TURN/UDP credentials") -and $p2p.Contains("openrelay.metered.ca")) { throw "old TURN block still present" }
+          if (-not $p2p.Contains("kProtocolVersion = 1")) { throw "protocol version guard missing" }
+          if (-not $p2p.Contains("serializeProtocolHello")) { throw "protocol hello send missing" }
+          if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
+          if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
+          if ($p2p.Contains("openrelay.metered.ca")) { throw "old public TURN relay still present after patch" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
-          if (-not $cursor.Contains("playerLabel")) { throw "player music label rendering missing" }
+          if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }
+          if (-not $cursor.Contains("LevelTools::getAudioTitle")) { throw "official song title lookup missing" }
 
       - name: Build Geode mod
         id: build
@@ -44,5 +51,5 @@ jobs:
       - name: Upload .geode artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lichigmdj.multiplayereditx-0.5.1
+          name: lichigmdj.multiplayereditx-0.5.1-rc
           path: ${{ steps.build.outputs.build-output }}

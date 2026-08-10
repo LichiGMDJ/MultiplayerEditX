@@ -26,6 +26,7 @@ jobs:
           python -m py_compile scripts/patch_ack_integrity_reconnect_hardening.py
           python -m py_compile scripts/patch_integrity_compile_fix.py
           python -m py_compile scripts/patch_handshake_finalize.py
+          python -m py_compile scripts/patch_initial_sync_always_full.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -59,6 +60,9 @@ jobs:
 
       - name: Gate peer readiness on protocol handshake
         run: python scripts/patch_handshake_finalize.py
+
+      - name: Force authoritative initial level sync
+        run: python scripts/patch_initial_sync_always_full.py
 
       - name: Verify patched source markers
         shell: pwsh
@@ -104,7 +108,8 @@ jobs:
           if (-not $hooks.Contains("MAX_CHUNK_BYTES = 12000")) { throw "safe full-level sync chunk bytes missing" }
           if (-not $hooks.Contains("MAX_UUIDS_PER_CHUNK = 250")) { throw "safe full-level UUID chunk size missing" }
           if (-not $hooks.Contains("m_integrityCheckTimer")) { throw "periodic integrity timer missing" }
-          if (-not $hooks.Contains("waiting for digest before repair/resync")) { throw "reconnect-aware sync missing" }
+          if (-not $hooks.Contains("authoritative initial sync_level")) { throw "authoritative initial full sync missing" }
+          if ($hooks.Contains("waiting for digest before repair/resync")) { throw "reconnect still skips initial SyncLevel" }
           if (-not $hooks.Contains("sendFullLevelSyncTo")) { throw "full SyncLevel fallback helper missing" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
           if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }

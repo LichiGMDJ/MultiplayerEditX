@@ -5,16 +5,23 @@ project(MultiplayerEdit VERSION 0.5.1)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
-    set(CMAKE_OSX_ARCHITECTURES "arm64")
-else()
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+# Apple-only architecture selection. Do not leak macOS/iOS settings into
+# Android cross-compilation.
+if (APPLE)
+    if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
+        set(CMAKE_OSX_ARCHITECTURES "arm64")
+    else()
+        set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+    endif()
 endif()
 
-# Windows definitions to prevent macros from breaking C++ std::min/std::max/limits
-add_compile_definitions(WIN32_LEAN_AND_MEAN)
-add_compile_definitions(NOMINMAX)
-add_compile_definitions(_WINSOCKAPI_)
+# Windows-only definitions to prevent Win32 macros from breaking C++
+# std::min/std::max/limits. These must not be exported to Android builds.
+if (WIN32)
+    add_compile_definitions(WIN32_LEAN_AND_MEAN)
+    add_compile_definitions(NOMINMAX)
+    add_compile_definitions(_WINSOCKAPI_)
+endif()
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 

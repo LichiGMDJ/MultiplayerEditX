@@ -13,8 +13,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Patch self-hosted signaling and TURN/UDP
+      - name: Validate safety patch script
+        run: python -m py_compile scripts/patch_turn_udp.py
+
+      - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
+
+      - name: Verify patched source markers
+        shell: pwsh
+        run: |
+          $p2p = Get-Content src/P2PManager.cpp -Raw
+          $hooks = Get-Content src/EditorHooks.cpp -Raw
+          $cursor = Get-Content src/ui/CursorNode.cpp -Raw
+
+          if (-not $p2p.Contains("kSafeMessageBytes")) { throw "safe SCTP message guard missing" }
+          if (-not $p2p.Contains("kMaxInboundMessageBytes")) { throw "inbound packet guard missing" }
+          if (-not $p2p.Contains("local-only TURN/UDP credentials") -and $p2p.Contains("openrelay.metered.ca")) { throw "old TURN block still present" }
+          if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
+          if (-not $cursor.Contains("playerLabel")) { throw "player music label rendering missing" }
 
       - name: Build Geode mod
         id: build
@@ -28,5 +44,5 @@ jobs:
       - name: Upload .geode artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lichigmdj.multiplayereditx
+          name: lichigmdj.multiplayereditx-0.5.1
           path: ${{ steps.build.outputs.build-output }}

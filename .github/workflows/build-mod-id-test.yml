@@ -24,6 +24,7 @@ jobs:
           python -m py_compile scripts/patch_processing_remote_guard.py
           python -m py_compile scripts/patch_ack_integrity_reconnect.py
           python -m py_compile scripts/patch_ack_integrity_reconnect_hardening.py
+          python -m py_compile scripts/patch_integrity_compile_fix.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -52,6 +53,9 @@ jobs:
       - name: Harden ACK integrity reconnect layer
         run: python scripts/patch_ack_integrity_reconnect_hardening.py
 
+      - name: Apply integrity compile interface fix
+        run: python scripts/patch_integrity_compile_fix.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -61,6 +65,7 @@ jobs:
           $hooks = Get-Content src/EditorHooks.cpp -Raw
           $remote = Get-Content src/RemoteActionHandler.cpp -Raw
           $remoteHeader = Get-Content src/RemoteActionHandler.hpp -Raw
+          $actionHeader = Get-Content src/ActionSerializer.hpp -Raw
           $cursor = Get-Content src/ui/CursorNode.cpp -Raw
 
           if (-not $p2p.Contains("kSafeMessageBytes = 24 * 1024")) { throw "paced SCTP packet size missing" }
@@ -106,6 +111,8 @@ jobs:
           if (-not $remote.Contains("targeted repair requested")) { throw "targeted repair logic missing" }
           if (-not $remote.Contains("full SyncLevel requested")) { throw "full resync handler missing" }
           if (-not $remoteHeader.Contains("#include <utility>")) { throw "integrity API standard include missing" }
+          if (-not $actionHeader.Contains("parseSaveStringOrdered")) { throw "ordered save-string helper declaration missing" }
+          if (-not $actionHeader.Contains("buildSaveStringOrdered")) { throw "ordered save-string builder declaration missing" }
           if (-not $remote.Contains("struct ProcessingRemoteGuard")) { throw "remote-processing RAII guard missing" }
           if (-not $remote.Contains("ProcessingRemoteGuard processingRemoteGuard")) { throw "remote handlers are not guarded" }
           if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }

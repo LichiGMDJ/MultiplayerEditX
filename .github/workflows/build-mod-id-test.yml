@@ -22,6 +22,7 @@ jobs:
           python -m py_compile scripts/patch_reliable_editor_retry.py
           python -m py_compile scripts/patch_reliable_transport_queue.py
           python -m py_compile scripts/patch_processing_remote_guard.py
+          python -m py_compile scripts/patch_ack_integrity_reconnect.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -44,6 +45,9 @@ jobs:
       - name: Apply remote-processing RAII guard
         run: python scripts/patch_processing_remote_guard.py
 
+      - name: Apply ACK integrity reconnect layer
+        run: python scripts/patch_ack_integrity_reconnect.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -56,21 +60,32 @@ jobs:
 
           if (-not $p2p.Contains("kSafeMessageBytes = 24 * 1024")) { throw "paced SCTP packet size missing" }
           if (-not $p2p.Contains("kMaxInboundMessageBytes")) { throw "inbound packet guard missing" }
-          if (-not $p2p.Contains("kProtocolVersion = 1")) { throw "protocol version guard missing" }
+          if (-not $p2p.Contains("kProtocolVersion = 2")) { throw "protocol v2 guard missing" }
           if (-not $p2p.Contains("serializeProtocolHello")) { throw "protocol hello send missing" }
           if (-not $p2p.Contains("replaying {} buffered packets")) { throw "pre-handshake replay logic missing" }
           if (-not $p2p.Contains("flushBulkReliableQueues")) { throw "reliable FIFO drain missing" }
-          if (-not $p2p.Contains("queued reliable editor opcode")) { throw "editor reliable FIFO enqueue missing" }
-          if (-not $p2p.Contains("reliable FIFO send deferred")) { throw "reliable FIFO retry path missing" }
-          if (-not $p2p.Contains("opcode == proto::Opcode::MoveObjects")) { throw "move packets are not in ordered FIFO" }
-          if (-not $p2p.Contains("opcode == proto::Opcode::PlaceObjects")) { throw "placement packets are not in ordered FIFO" }
-          if (-not $p2pHeader.Contains("bulkReliableQueue")) { throw "reliable FIFO state missing" }
+          if (-not $p2p.Contains("queueTrackedReliable")) { throw "tracked reliable enqueue missing" }
+          if (-not $p2p.Contains("ReliableEnvelope")) { throw "reliable envelope path missing" }
+          if (-not $p2p.Contains("ReliableAck")) { throw "ACK path missing" }
+          if (-not $p2p.Contains("RETRY #")) { throw "ACK timeout retry missing" }
+          if (-not $p2p.Contains("duplicate #")) { throw "reliable dedup missing" }
+          if (-not $p2p.Contains("scheduleClientReconnect")) { throw "client reconnect scheduler missing" }
+          if (-not $p2p.Contains("classified as reconnect")) { throw "host reconnect classification missing" }
+          if (-not $p2pHeader.Contains("pendingReliableAcks")) { throw "pending ACK state missing" }
+          if (-not $p2pHeader.Contains("receivedReliableSequences")) { throw "dedup state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
           if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
+          if (-not $protoHeader.Contains("LevelDigest")) { throw "level digest protocol missing" }
+          if (-not $protoHeader.Contains("LevelManifest")) { throw "level manifest protocol missing" }
+          if (-not $protoHeader.Contains("LevelRepairRequest")) { throw "targeted repair protocol missing" }
+          if (-not $protoHeader.Contains("FullResyncRequest")) { throw "full resync fallback protocol missing" }
           if ($p2p.Contains("openrelay.metered.ca")) { throw "old public TURN relay still present after patch" }
           if (-not $hooks.Contains("MAX_CHUNK_BYTES = 12000")) { throw "safe full-level sync chunk bytes missing" }
           if (-not $hooks.Contains("MAX_UUIDS_PER_CHUNK = 250")) { throw "safe full-level UUID chunk size missing" }
+          if (-not $hooks.Contains("m_integrityCheckTimer")) { throw "periodic integrity timer missing" }
+          if (-not $hooks.Contains("waiting for digest before repair/resync")) { throw "reconnect-aware sync missing" }
+          if (-not $hooks.Contains("sendFullLevelSyncTo")) { throw "full SyncLevel fallback helper missing" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
           if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }
           if (-not $hooks.Contains("externally-created objects")) { throw "external placement reconciliation missing" }
@@ -78,6 +93,10 @@ jobs:
           if (-not $hooks.Contains("s_inBulkPasteSync")) { throw "bulk paste guard missing" }
           if (-not $hooks.Contains("pasteObjects(gd::string")) { throw "EditorUI pasteObjects hook missing" }
           if (-not $hooks.Contains("bulk paste synced")) { throw "finalized bulk paste send missing" }
+          if (-not $remote.Contains("stableIntegrityHash")) { throw "stable level hash missing" }
+          if (-not $remote.Contains("LEVEL HASH mismatch")) { throw "digest comparison missing" }
+          if (-not $remote.Contains("targeted repair requested")) { throw "targeted repair logic missing" }
+          if (-not $remote.Contains("full SyncLevel requested")) { throw "full resync handler missing" }
           if (-not $remote.Contains("struct ProcessingRemoteGuard")) { throw "remote-processing RAII guard missing" }
           if (-not $remote.Contains("ProcessingRemoteGuard processingRemoteGuard")) { throw "remote handlers are not guarded" }
           if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }

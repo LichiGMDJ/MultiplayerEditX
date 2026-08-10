@@ -8,10 +8,72 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# P2PManager: self-hosted TURN, local-only credentials, packet safety.
+# Binary protocol: add an explicit compatibility handshake for 0.5.1+.
+# -----------------------------------------------------------------------------
+proto_hpp_path = Path("src/BinaryProtocol.hpp")
+proto_hpp = proto_hpp_path.read_text(encoding="utf-8")
+proto_hpp = replace_once(
+    proto_hpp,
+    '''        Reconnect         = 0x34,\n\n        // Cursor (unreliable channel)''',
+    '''        Reconnect         = 0x34,\n        ProtocolHello     = 0x35,\n\n        // Cursor (unreliable channel)''',
+    "ProtocolHello opcode",
+)
+proto_hpp = replace_once(
+    proto_hpp,
+    '''    std::vector<uint8_t> serializePlayerLeft(int playerId);\n    std::vector<uint8_t> serializeError(std::string const& message);''',
+    '''    std::vector<uint8_t> serializePlayerLeft(int playerId);\n    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion);\n    std::vector<uint8_t> serializeError(std::string const& message);''',
+    "ProtocolHello serializer declaration",
+)
+proto_hpp = replace_once(
+    proto_hpp,
+    '''    struct PlayerLeftMsg {\n        int playerId;\n    };\n    PlayerLeftMsg deserializePlayerLeft(Reader& r);\n\n    struct ErrorMsg {''',
+    '''    struct PlayerLeftMsg {\n        int playerId;\n    };\n    PlayerLeftMsg deserializePlayerLeft(Reader& r);\n\n    struct ProtocolHelloMsg {\n        uint32_t protocolVersion = 0;\n    };\n    ProtocolHelloMsg deserializeProtocolHello(Reader& r);\n\n    struct ErrorMsg {''',
+    "ProtocolHello message declaration",
+)
+proto_hpp_path.write_text(proto_hpp, encoding="utf-8")
+
+proto_cpp_path = Path("src/BinaryProtocol.cpp")
+proto_cpp = proto_cpp_path.read_text(encoding="utf-8")
+proto_cpp = replace_once(
+    proto_cpp,
+    '''    std::vector<uint8_t> serializePlayerLeft(int playerId) {\n        Writer w;\n        w.writeOpcode(Opcode::PlayerLeft);\n        w.writeVarInt(static_cast<uint32_t>(playerId));\n        return std::move(w.takeData());\n    }\n\n    std::vector<uint8_t> serializeError(std::string const& message) {''',
+    '''    std::vector<uint8_t> serializePlayerLeft(int playerId) {\n        Writer w;\n        w.writeOpcode(Opcode::PlayerLeft);\n        w.writeVarInt(static_cast<uint32_t>(playerId));\n        return std::move(w.takeData());\n    }\n\n    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion) {\n        Writer w;\n        w.writeOpcode(Opcode::ProtocolHello);\n        w.writeVarInt(protocolVersion);\n        return std::move(w.takeData());\n    }\n\n    std::vector<uint8_t> serializeError(std::string const& message) {''',
+    "ProtocolHello serializer",
+)
+proto_cpp = replace_once(
+    proto_cpp,
+    '''    PlayerLeftMsg deserializePlayerLeft(Reader& r) {\n        PlayerLeftMsg msg;\n        msg.playerId = static_cast<int>(r.readVarInt());\n        return msg;\n    }\n\n    ErrorMsg deserializeError(Reader& r) {''',
+    '''    PlayerLeftMsg deserializePlayerLeft(Reader& r) {\n        PlayerLeftMsg msg;\n        msg.playerId = static_cast<int>(r.readVarInt());\n        return msg;\n    }\n\n    ProtocolHelloMsg deserializeProtocolHello(Reader& r) {\n        ProtocolHelloMsg msg;\n        msg.protocolVersion = r.readVarInt();\n        return msg;\n    }\n\n    ErrorMsg deserializeError(Reader& r) {''',
+    "ProtocolHello deserializer",
+)
+proto_cpp_path.write_text(proto_cpp, encoding="utf-8")
+
+
+# Track whether each peer completed the compatibility handshake.
+p2p_hpp_path = Path("src/P2PManager.hpp")
+p2p_hpp = p2p_hpp_path.read_text(encoding="utf-8")
+p2p_hpp = replace_once(
+    p2p_hpp,
+    '''            bool ready = false; // both channels open\n            std::vector<PendingMessage> pendingMessages;''',
+    '''            bool ready = false; // both channels open\n            bool protocolVerified = false;\n            uint32_t protocolVersion = 0;\n            std::vector<PendingMessage> pendingMessages;''',
+    "peer protocol state",
+)
+p2p_hpp_path.write_text(p2p_hpp, encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+# P2PManager: self-hosted TURN, local-only credentials, packet safety and
+# protocol compatibility gating.
 # -----------------------------------------------------------------------------
 p2p_path = Path("src/P2PManager.cpp")
 p2p = p2p_path.read_text(encoding="utf-8")
+
+p2p = replace_once(
+    p2p,
+    '''namespace mpedit {\n\n\n\n    P2PManager& P2PManager::get() {''',
+    '''namespace mpedit {\n\n    namespace {\n        constexpr uint32_t kProtocolVersion = 1;\n    }\n\n    P2PManager& P2PManager::get() {''',
+    "protocol version constant",
+)
 
 p2p = replace_once(
     p2p,
@@ -198,7 +260,7 @@ p2p = replace_once(
     "safe data-channel send patch",
 )
 
-# Bound remote allocations and queue growth before copying untrusted peer data.
+# Validate ProtocolHello before accepting or relaying any editor traffic.
 p2p = replace_once(
     p2p,
     '''    void P2PManager::onPeerMessage(int fromPlayerId, const uint8_t* data, size_t len) {
@@ -225,6 +287,60 @@ p2p = replace_once(
             return;
         }
 
+        uint8_t opcode = data[0];
+        if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) {
+            proto::Reader helloReader(data + 1, len - 1);
+            auto hello = proto::deserializeProtocolHello(helloReader);
+            if (helloReader.hasError() || hello.protocolVersion != kProtocolVersion) {
+                log::warn(
+                    "P2PManager: incompatible protocol from player {} (remote={}, local={})",
+                    fromPlayerId,
+                    hello.protocolVersion,
+                    kProtocolVersion
+                );
+
+                auto errorMsg = proto::serializeError(
+                    "Incompatible Multiplayer Edit protocol. Both players must use v0.5.1 or newer compatible builds."
+                );
+                sendTo(fromPlayerId, errorMsg, ChannelType::Reliable);
+
+                if (m_role == Role::Client && fromPlayerId == 0) {
+                    queueInMainThread([this]() {
+                        for (auto& cb : m_onError) {
+                            cb("Incompatible Multiplayer Edit protocol");
+                        }
+                    });
+                }
+                return;
+            }
+
+            {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(fromPlayerId);
+                if (it != m_peers.end()) {
+                    it->second.protocolVerified = true;
+                    it->second.protocolVersion = hello.protocolVersion;
+                }
+            }
+            log::info("P2PManager: protocol v{} verified for player {}", hello.protocolVersion, fromPlayerId);
+            return;
+        }
+
+        bool protocolVerified = false;
+        {
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(fromPlayerId);
+            protocolVerified = it != m_peers.end() && it->second.protocolVerified;
+        }
+        if (!protocolVerified) {
+            log::warn(
+                "P2PManager: dropping opcode {} from player {} before protocol handshake",
+                static_cast<int>(opcode),
+                fromPlayerId
+            );
+            return;
+        }
+
         {
             std::lock_guard lock(m_incomingMutex);
             if (m_incoming.size() >= kMaxIncomingQueue) {
@@ -236,7 +352,14 @@ p2p = replace_once(
                 std::vector<uint8_t>(data, data + len)
             });
         }''',
-    "inbound packet safety patch",
+    "protocol and inbound packet safety patch",
+)
+
+# Do not relay the private peer-to-host compatibility handshake.
+p2p = p2p.replace(
+    '''        if (m_role == Role::Host) {\n            uint8_t opcode = data[0];\n            ChannelType ch = ChannelType::Reliable;''',
+    '''        if (m_role == Role::Host) {\n            uint8_t opcode = data[0];\n            if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) return;\n            ChannelType ch = ChannelType::Reliable;''',
+    1,
 )
 
 # A malformed peer packet or third-party editor edge case must not escape a
@@ -274,13 +397,32 @@ p2p = replace_once(
     "handler exception containment patch",
 )
 
+# ProtocolHello must be the first application message after both channels open,
+# before pending editor operations are flushed.
+p2p = replace_once(
+    p2p,
+    '''        if (!becameReady) return;
+
+        for (auto& msg : pending) {
+            sendTo(pid, msg.data, msg.channel);
+        }''',
+    '''        if (!becameReady) return;
+
+        auto hello = proto::serializeProtocolHello(kProtocolVersion);
+        sendTo(pid, hello, ChannelType::Reliable);
+
+        for (auto& msg : pending) {
+            sendTo(pid, msg.data, msg.channel);
+        }''',
+    "ProtocolHello send",
+)
+
 p2p_path.write_text(p2p, encoding="utf-8")
 
 
 # -----------------------------------------------------------------------------
 # EditorHooks: piggy-back player music state onto the existing cursor status.
-# This keeps the protocol backwards-compatible: existing mode/playtest parsers
-# still read their original leading fields and ignore the appended suffix.
+# Existing mode/playtest parsers keep their original leading fields.
 # -----------------------------------------------------------------------------
 hooks_path = Path("src/EditorHooks.cpp")
 hooks = hooks_path.read_text(encoding="utf-8")
@@ -304,8 +446,8 @@ hooks_path.write_text(hooks, encoding="utf-8")
 
 
 # -----------------------------------------------------------------------------
-# CursorNode: show the remote player's active song next to their name.
-# Custom songs use their song ID; official songs use the audio-track index.
+# CursorNode: show human-readable song information when GD already has the song
+# metadata cached. Fall back to the custom song ID if metadata is unavailable.
 # -----------------------------------------------------------------------------
 cursor_path = Path("src/ui/CursorNode.cpp")
 cursor = cursor_path.read_text(encoding="utf-8")
@@ -324,9 +466,21 @@ cursor = replace_once(
                     int songId = geode::utils::numFromString<int>(musicData.substr(0, sep)).unwrapOr(0);
                     int audioTrack = geode::utils::numFromString<int>(musicData.substr(sep + 1)).unwrapOr(0);
                     if (songId > 0) {
-                        playerLabel += "  [♪ " + std::to_string(songId) + "]";
+                        std::string songText;
+                        if (auto* song = LevelTools::getSongObject(songId)) {
+                            std::string songName = song->m_songName;
+                            std::string artistName = song->m_artistName;
+                            if (!songName.empty()) {
+                                songText = artistName.empty() ? songName : artistName + " - " + songName;
+                            }
+                        }
+                        if (songText.empty()) songText = "ID " + std::to_string(songId);
+                        if (songText.size() > 42) songText = songText.substr(0, 39) + "...";
+                        playerLabel += "  [♪ " + songText + "]";
                     } else if (audioTrack > 0) {
-                        playerLabel += "  [♪ GD " + std::to_string(audioTrack) + "]";
+                        std::string title = LevelTools::getAudioTitle(audioTrack);
+                        if (title.empty()) title = "GD " + std::to_string(audioTrack);
+                        playerLabel += "  [♪ " + title + "]";
                     }
                 }
             }
@@ -335,4 +489,4 @@ cursor = replace_once(
 )
 cursor_path.write_text(cursor, encoding="utf-8")
 
-print("Applied MultiplayerEditX 0.5.1 safety, compatibility, TURN and player-music patches")
+print("Applied MultiplayerEditX 0.5.1 safety, protocol, TURN and player-music patches")

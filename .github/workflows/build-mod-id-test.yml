@@ -32,7 +32,9 @@ jobs:
           if (-not $p2p.Contains("kMaxInboundMessageBytes")) { throw "inbound packet guard missing" }
           if (-not $p2p.Contains("kProtocolVersion = 1")) { throw "protocol version guard missing" }
           if (-not $p2p.Contains("serializeProtocolHello")) { throw "protocol hello send missing" }
+          if (-not $p2p.Contains("replaying {} buffered packets")) { throw "pre-handshake replay logic missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
+          if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
           if ($p2p.Contains("openrelay.metered.ca")) { throw "old public TURN relay still present after patch" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }

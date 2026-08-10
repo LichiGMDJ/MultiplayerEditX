@@ -86,6 +86,7 @@ for script, missing in [
     ("scripts/patch_global_shared_state_v4.py", "global shared state v4 patch missing"),
     ("scripts/patch_workshop_anchor_host_music_v5.py", "Object Workshop anchor / host music v5 patch missing"),
     ("scripts/patch_room_settings_v6.py", "Room Settings v6 patch missing"),
+    ("scripts/patch_room_settings_layout.py", "Room Settings layout patch missing"),
     ("scripts/patch_finalize_release.py", "final release verification patch missing"),
 ]:
     path = Path(script)

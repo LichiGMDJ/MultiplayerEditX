@@ -13,19 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify TURN secret is available
-        shell: pwsh
-        env:
-          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TURN_PASSWORD)) {
-            throw "TURN_PASSWORD repository secret is missing"
-          }
-          Write-Host "TURN_PASSWORD loaded successfully (length=$($env:TURN_PASSWORD.Length))"
-
       - name: Patch self-hosted signaling and TURN/UDP
-        env:
-          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
         run: python scripts/patch_turn_udp.py
 
       - name: Build Geode mod

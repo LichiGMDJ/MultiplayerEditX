@@ -49,13 +49,14 @@ proto_cpp = replace_once(
 proto_cpp_path.write_text(proto_cpp, encoding="utf-8")
 
 
-# Track whether each peer completed the compatibility handshake.
+# Track whether each peer completed the compatibility handshake and temporarily
+# retain early ordered packets until ProtocolHello is processed.
 p2p_hpp_path = Path("src/P2PManager.hpp")
 p2p_hpp = p2p_hpp_path.read_text(encoding="utf-8")
 p2p_hpp = replace_once(
     p2p_hpp,
     '''            bool ready = false; // both channels open\n            std::vector<PendingMessage> pendingMessages;''',
-    '''            bool ready = false; // both channels open\n            bool protocolVerified = false;\n            uint32_t protocolVersion = 0;\n            std::vector<PendingMessage> pendingMessages;''',
+    '''            bool ready = false; // both channels open\n            bool protocolVerified = false;\n            uint32_t protocolVersion = 0;\n            std::vector<std::vector<uint8_t>> preHandshakeMessages;\n            std::vector<PendingMessage> pendingMessages;''',
     "peer protocol state",
 )
 p2p_hpp_path.write_text(p2p_hpp, encoding="utf-8")
@@ -118,7 +119,6 @@ p2p = replace_once(
     "signaling URL patch",
 )
 
-# Avoid leaking ICE credentials / addressing details into normal logs.
 p2p = p2p.replace(
     'log::info("Answer SDP:\\n{}", sdp);',
     'log::debug("P2PManager: Received SDP answer ({} bytes)", sdp.size());',
@@ -128,7 +128,6 @@ p2p = p2p.replace(
     'log::debug("P2PManager: Generated SDP offer ({} bytes)", sdp.size());',
 )
 
-# Bound messages waiting for a peer that has not opened its data channel yet.
 p2p = replace_once(
     p2p,
     '''        if (!peer.ready) {
@@ -151,9 +150,6 @@ p2p = replace_once(
     "pending queue safety patch",
 )
 
-# libdatachannel throws std::invalid_argument for oversized SCTP messages. Split
-# bulk PlaceObjects traffic (Object Workshop / large pastes) and contain all send
-# exceptions so a third-party editor operation cannot crash Geometry Dash.
 p2p = replace_once(
     p2p,
     '''        if (dc && dc->isOpen()) {
@@ -260,7 +256,9 @@ p2p = replace_once(
     "safe data-channel send patch",
 )
 
-# Validate ProtocolHello before accepting or relaying any editor traffic.
+# Validate ProtocolHello before accepting editor traffic. Any packet that races
+# ahead of the hello is buffered instead of discarded; once the hello is valid,
+# buffered packets are replayed through the normal validation path.
 p2p = replace_once(
     p2p,
     '''    void P2PManager::onPeerMessage(int fromPlayerId, const uint8_t* data, size_t len) {
@@ -276,6 +274,7 @@ p2p = replace_once(
     '''    void P2PManager::onPeerMessage(int fromPlayerId, const uint8_t* data, size_t len) {
         constexpr size_t kMaxInboundMessageBytes = 256 * 1024;
         constexpr size_t kMaxIncomingQueue = 1024;
+        constexpr size_t kMaxPreHandshakeMessages = 64;
 
         if (len == 0) return;
         if (!data || len > kMaxInboundMessageBytes) {
@@ -314,15 +313,29 @@ p2p = replace_once(
                 return;
             }
 
+            std::vector<std::vector<uint8_t>> buffered;
             {
                 std::lock_guard lock(m_peersMutex);
                 auto it = m_peers.find(fromPlayerId);
                 if (it != m_peers.end()) {
                     it->second.protocolVerified = true;
                     it->second.protocolVersion = hello.protocolVersion;
+                    buffered = std::move(it->second.preHandshakeMessages);
+                    it->second.preHandshakeMessages.clear();
                 }
             }
-            log::info("P2PManager: protocol v{} verified for player {}", hello.protocolVersion, fromPlayerId);
+            log::info(
+                "P2PManager: protocol v{} verified for player {} (replaying {} buffered packets)",
+                hello.protocolVersion,
+                fromPlayerId,
+                buffered.size()
+            );
+
+            for (auto const& packet : buffered) {
+                if (!packet.empty()) {
+                    onPeerMessage(fromPlayerId, packet.data(), packet.size());
+                }
+            }
             return;
         }
 
@@ -330,16 +343,27 @@ p2p = replace_once(
         {
             std::lock_guard lock(m_peersMutex);
             auto it = m_peers.find(fromPlayerId);
-            protocolVerified = it != m_peers.end() && it->second.protocolVerified;
+            if (it != m_peers.end()) {
+                protocolVerified = it->second.protocolVerified;
+                if (!protocolVerified) {
+                    if (it->second.preHandshakeMessages.size() < kMaxPreHandshakeMessages) {
+                        it->second.preHandshakeMessages.emplace_back(data, data + len);
+                        log::debug(
+                            "P2PManager: buffered opcode {} from player {} until protocol handshake",
+                            static_cast<int>(opcode),
+                            fromPlayerId
+                        );
+                    } else {
+                        log::warn(
+                            "P2PManager: pre-handshake queue full for player {}; dropping opcode {}",
+                            fromPlayerId,
+                            static_cast<int>(opcode)
+                        );
+                    }
+                }
+            }
         }
-        if (!protocolVerified) {
-            log::warn(
-                "P2PManager: dropping opcode {} from player {} before protocol handshake",
-                static_cast<int>(opcode),
-                fromPlayerId
-            );
-            return;
-        }
+        if (!protocolVerified) return;
 
         {
             std::lock_guard lock(m_incomingMutex);
@@ -355,15 +379,12 @@ p2p = replace_once(
     "protocol and inbound packet safety patch",
 )
 
-# Do not relay the private peer-to-host compatibility handshake.
 p2p = p2p.replace(
     '''        if (m_role == Role::Host) {\n            uint8_t opcode = data[0];\n            ChannelType ch = ChannelType::Reliable;''',
     '''        if (m_role == Role::Host) {\n            uint8_t opcode = data[0];\n            if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) return;\n            ChannelType ch = ChannelType::Reliable;''',
     1,
 )
 
-# A malformed peer packet or third-party editor edge case must not escape a
-# message handler and terminate the game process.
 p2p = replace_once(
     p2p,
     '''                        proto::Reader handlerReader(msg.data.data() + 1, msg.data.size() - 1);
@@ -397,8 +418,6 @@ p2p = replace_once(
     "handler exception containment patch",
 )
 
-# ProtocolHello must be the first application message after both channels open,
-# before pending editor operations are flushed.
 p2p = replace_once(
     p2p,
     '''        if (!becameReady) return;

@@ -25,6 +25,7 @@ jobs:
           python -m py_compile scripts/patch_ack_integrity_reconnect.py
           python -m py_compile scripts/patch_ack_integrity_reconnect_hardening.py
           python -m py_compile scripts/patch_integrity_compile_fix.py
+          python -m py_compile scripts/patch_handshake_finalize.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -56,6 +57,9 @@ jobs:
       - name: Apply integrity compile interface fix
         run: python scripts/patch_integrity_compile_fix.py
 
+      - name: Gate peer readiness on protocol handshake
+        run: python scripts/patch_handshake_finalize.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -83,6 +87,10 @@ jobs:
           if (-not $p2p.Contains("classified as reconnect")) { throw "host reconnect classification missing" }
           if (-not $p2p.Contains("reconnect response had no playerId")) { throw "reconnect malformed-response retry missing" }
           if (-not $p2p.Contains("LevelRepairRequest")) { throw "integrity control relay guard missing" }
+          if (-not $p2p.Contains("finalizePeerHandshake")) { throw "protocol-gated peer finalize missing" }
+          if (-not $p2p.Contains("waiting for protocol handshake")) { throw "transport-ready/protocol-ready split missing" }
+          if (-not $p2p.Contains("releasing {} pending messages")) { throw "pending release after handshake missing" }
+          if (-not $p2pHeader.Contains("connectionAnnounced")) { throw "single peer announcement guard missing" }
           if (-not $p2pHeader.Contains("pendingReliableAcks")) { throw "pending ACK state missing" }
           if (-not $p2pHeader.Contains("receivedReliableSequences")) { throw "dedup state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }

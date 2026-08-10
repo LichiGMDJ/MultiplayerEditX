@@ -18,6 +18,7 @@ jobs:
           python -m py_compile scripts/patch_turn_udp.py
           python -m py_compile scripts/patch_external_editor_sync.py
           python -m py_compile scripts/patch_bulk_paste_sync.py
+          python -m py_compile scripts/patch_bulk_transport_queue.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -28,6 +29,9 @@ jobs:
       - name: Apply finalized bulk paste patch
         run: python scripts/patch_bulk_paste_sync.py
 
+      - name: Apply paced bulk transport patch
+        run: python scripts/patch_bulk_transport_queue.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -37,11 +41,14 @@ jobs:
           $hooks = Get-Content src/EditorHooks.cpp -Raw
           $cursor = Get-Content src/ui/CursorNode.cpp -Raw
 
-          if (-not $p2p.Contains("kSafeMessageBytes")) { throw "safe SCTP message guard missing" }
+          if (-not $p2p.Contains("kSafeMessageBytes = 24 * 1024")) { throw "paced SCTP packet size missing" }
           if (-not $p2p.Contains("kMaxInboundMessageBytes")) { throw "inbound packet guard missing" }
           if (-not $p2p.Contains("kProtocolVersion = 1")) { throw "protocol version guard missing" }
           if (-not $p2p.Contains("serializeProtocolHello")) { throw "protocol hello send missing" }
           if (-not $p2p.Contains("replaying {} buffered packets")) { throw "pre-handshake replay logic missing" }
+          if (-not $p2p.Contains("flushBulkReliableQueues")) { throw "bulk queue drain missing" }
+          if (-not $p2p.Contains("bulk send deferred")) { throw "bulk retry path missing" }
+          if (-not $p2pHeader.Contains("bulkReliableQueue")) { throw "bulk reliable queue state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
           if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }

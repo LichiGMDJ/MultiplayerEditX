@@ -1,0 +1,28 @@
+name: Build Mod ID Test
+
+on:
+  push:
+    branches:
+      - mod-id-lichigmdj
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: 5.7.1
+          target: Win64
+          configure-args: -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Upload .geode artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichigmdj.multiplayereditx
+          path: ${{ steps.build.outputs.build-output }}

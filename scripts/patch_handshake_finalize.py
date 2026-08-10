@@ -62,70 +62,7 @@ cpp = replace_once(
     "finalize only after protocol hello",
 )
 
-old_check = '''    void P2PManager::checkPeerReady(int playerId) {
-        bool becameReady = false;
-        int pid = -1;
-        std::string name;
-        int colorIdx = 0;
-        std::vector<PendingMessage> pending;
-
-        {
-            std::lock_guard lock(m_peersMutex);
-            auto it = m_peers.find(playerId);
-            if (it == m_peers.end()) return;
-
-            auto& peer = it->second;
-            bool reliableOpen = peer.reliable && peer.reliable->isOpen();
-            bool unreliableOpen = peer.unreliable && peer.unreliable->isOpen();
-
-            if (reliableOpen && unreliableOpen && !peer.ready) {
-                peer.ready = true;
-                pid = peer.playerId;
-                name = peer.playerName;
-                colorIdx = peer.colorIndex;
-                becameReady = true;
-
-                pending = std::move(peer.pendingMessages);
-                peer.pendingMessages.clear();
-
-                log::info("P2PManager: Player {} ({}) fully connected", pid, name);
-            }
-        }
-
-        if (!becameReady) return;
-
-        auto hello = proto::serializeProtocolHello(kProtocolVersion);
-        sendTo(pid, hello, ChannelType::Reliable);
-
-        for (auto& msg : pending) {
-            sendTo(pid, msg.data, msg.channel);
-        }
-
-        if (m_role == Role::Client && pid == 0) {
-            m_state.store(State::Connected);
-            stopSignalPolling();
-        }
-
-        queueInMainThread([this, pid, name, colorIdx]() {
-            if (m_role == Role::Client && pid == 0) {
-                auto roomCode = getRoomCode();
-                for (auto& cb : m_onSessionStarted) {
-                    cb(roomCode, m_localPlayerId);
-                }
-            }
-
-            for (auto& cb : m_onPeerConnected) {
-                cb(pid, name, colorIdx);
-            }
-
-            if (m_role == Role::Host) {
-                auto msg = proto::serializePlayerJoined(pid, name, colorIdx);
-                broadcast(msg, ChannelType::Reliable, pid);
-            }
-        });
-    }'''
-
-new_check = '''    void P2PManager::finalizePeerHandshake(int playerId) {
+new_functions = '''    void P2PManager::finalizePeerHandshake(int playerId) {
         int pid = -1;
         std::string name;
         int colorIdx = 0;
@@ -217,9 +154,23 @@ new_check = '''    void P2PManager::finalizePeerHandshake(int playerId) {
         // the editor reliable FIFO. The peer is not announced yet.
         auto hello = proto::serializeProtocolHello(kProtocolVersion);
         sendTo(pid, hello, ChannelType::Reliable);
-    }'''
+    }
 
-cpp = replace_once(cpp, old_check, new_check, "protocol-gated peer finalization")
+
+'''
+
+# Previous reliability/reconnect patches legitimately edit checkPeerReady(), so
+# do not require an exact copy of its body. Replace the function by its stable
+# declaration boundary instead. This still refuses to patch if either boundary
+# is missing or appears in an unexpected order.
+start_marker = "    void P2PManager::checkPeerReady(int playerId) {"
+end_marker = "    void P2PManager::leaveSession() {"
+start = cpp.find(start_marker)
+end = cpp.find(end_marker, start + len(start_marker)) if start != -1 else -1
+if start == -1 or end == -1 or end <= start:
+    raise SystemExit("protocol-gated peer finalization: checkPeerReady/leaveSession boundaries not found; refusing to patch")
+
+cpp = cpp[:start] + new_functions + cpp[end:]
 
 cpp_path.write_text(cpp, encoding="utf-8")
 print("Patched transport-ready vs protocol-ready state machine")

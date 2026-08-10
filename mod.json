@@ -8,9 +8,12 @@
     },
     "id": "lichigmdj.multiplayereditx",
     "name": "Multiplayer Edit",
-    "version": "0.4.4",
+    "version": "0.5.0",
     "developer": "LichiGMDJ",
     "description": "Fork of Multiplayer Edit by xXoanon. Collaborate with friends in real-time level editing, host a session, and build together.",
+    "links": {
+        "source": "https://github.com/LichiGMDJ/MultiplayerEdit"
+    },
     "tags": [
         "editor",
         "online",

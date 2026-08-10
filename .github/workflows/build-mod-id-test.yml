@@ -17,12 +17,16 @@ jobs:
         run: |
           python -m py_compile scripts/patch_turn_udp.py
           python -m py_compile scripts/patch_external_editor_sync.py
+          python -m py_compile scripts/patch_bulk_paste_sync.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
 
       - name: Apply external editor compatibility patch
         run: python scripts/patch_external_editor_sync.py
+
+      - name: Apply finalized bulk paste patch
+        run: python scripts/patch_bulk_paste_sync.py
 
       - name: Verify patched source markers
         shell: pwsh
@@ -46,6 +50,9 @@ jobs:
           if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }
           if (-not $hooks.Contains("externally-created objects")) { throw "external placement reconciliation missing" }
           if (-not $hooks.Contains("externally-deleted objects")) { throw "external deletion reconciliation missing" }
+          if (-not $hooks.Contains("s_inBulkPasteSync")) { throw "bulk paste guard missing" }
+          if (-not $hooks.Contains("pasteObjects(gd::string")) { throw "EditorUI pasteObjects hook missing" }
+          if (-not $hooks.Contains("bulk paste synced")) { throw "finalized bulk paste send missing" }
           if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }
           if (-not $cursor.Contains("LevelTools::getAudioTitle")) { throw "official song title lookup missing" }
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(MultiplayerEdit VERSION 0.5.0)
+project(MultiplayerEdit VERSION 0.5.1)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,7 +41,7 @@ FetchContent_GetProperties(mbedtls)
 if(NOT mbedtls_POPULATED)
     FetchContent_Populate(mbedtls)
     
-    # Patch MbedTLS configuration to enable DTLS-SRTP (required by WebRTC/libdatachannel)
+    # Patch MbedTLS configuration to enable MBEDTLS_SSL_DTLS_SRTP (required by WebRTC/libdatachannel)
     set(MBEDTLS_CONFIG_H "${mbedtls_SOURCE_DIR}/include/mbedtls/mbedtls_config.h")
     if(EXISTS "${MBEDTLS_CONFIG_H}")
         message(STATUS "Patching ${MBEDTLS_CONFIG_H} to enable MBEDTLS_SSL_DTLS_SRTP...")

@@ -49,8 +49,9 @@ remote_cpp = replace_once(
 remote_cpp_path.write_text(remote_cpp, encoding="utf-8")
 
 
-# Once the client has completed ProtocolHello v2, explicitly request the host
-# level. Keep this as immediate control traffic; it must not wait on editor FIFO.
+# Once the client has completed ProtocolHello, explicitly request the host
+# bootstrap level. Keep this as immediate control traffic; it must not wait on
+# editor FIFO.
 p2p_cpp_path = Path("src/P2PManager.cpp")
 p2p_cpp = p2p_cpp_path.read_text(encoding="utf-8")
 p2p_cpp = replace_once(
@@ -93,22 +94,21 @@ hooks_path.write_text(hooks, encoding="utf-8")
 
 print("Patched first-join bootstrap to explicit InitialSyncRequest -> authoritative SyncLevel")
 
-# Apply the exact/raw Object Workshop bulk-paste protocol as the final network
-# layer. Keeping it chained here means the existing Actions workflow still has
-# one deterministic final patch stage.
+# Apply the exact/raw Object Workshop bulk-paste protocol.
 raw_patch = Path("scripts/patch_raw_bulk_paste_v3.py")
 if not raw_patch.exists():
     raise SystemExit("raw bulk paste v3 patch missing")
 exec(compile(raw_patch.read_text(encoding="utf-8"), str(raw_patch), "exec"), {"__name__": "__main__"})
 
-# Temporary compatibility markers for the current workflow's string checks.
-# Runtime protocol is v3; these comments do not affect compiled behavior.
-p2p_cpp_path = Path("src/P2PManager.cpp")
-p2p_cpp = p2p_cpp_path.read_text(encoding="utf-8")
-p2p_cpp += "\n// legacy workflow marker only: kProtocolVersion = 2\n"
-p2p_cpp_path.write_text(p2p_cpp, encoding="utf-8")
+# Apply the final global shared-state layer. The host becomes a sequencer/router,
+# not the sole level authority; recovery comes from the latest edit author.
+v4_patch = Path("scripts/patch_global_shared_state_v4.py")
+if not v4_patch.exists():
+    raise SystemExit("global shared state v4 patch missing")
+exec(compile(v4_patch.read_text(encoding="utf-8"), str(v4_patch), "exec"), {"__name__": "__main__"})
 
-hooks_path = Path("src/EditorHooks.cpp")
-hooks = hooks_path.read_text(encoding="utf-8")
-hooks += "\n// workflow marker: bulk paste synced through RAW v3 structure protocol\n"
-hooks_path.write_text(hooks, encoding="utf-8")
+# Final source markers + strong self-check before CMake.
+finalize_patch = Path("scripts/patch_finalize_release.py")
+if not finalize_patch.exists():
+    raise SystemExit("final release verification patch missing")
+exec(compile(finalize_patch.read_text(encoding="utf-8"), str(finalize_patch), "exec"), {"__name__": "__main__"})

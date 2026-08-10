@@ -94,27 +94,26 @@ hooks_path.write_text(hooks, encoding="utf-8")
 
 print("Patched first-join bootstrap to explicit InitialSyncRequest -> authoritative SyncLevel")
 
-# Normalize the anonymous-namespace anchor after ProcessingRemoteGuard so the
-# RAW bulk-paste patch can be applied deterministically after all earlier layers.
 bridge_patch = Path("scripts/patch_raw_bulk_anchor_bridge.py")
 if not bridge_patch.exists():
     raise SystemExit("raw bulk anchor bridge patch missing")
 exec(compile(bridge_patch.read_text(encoding="utf-8"), str(bridge_patch), "exec"), {"__name__": "__main__"})
 
-# Apply the exact/raw Object Workshop bulk-paste protocol.
 raw_patch = Path("scripts/patch_raw_bulk_paste_v3.py")
 if not raw_patch.exists():
     raise SystemExit("raw bulk paste v3 patch missing")
 exec(compile(raw_patch.read_text(encoding="utf-8"), str(raw_patch), "exec"), {"__name__": "__main__"})
 
-# Apply the final global shared-state layer. The host becomes a sequencer/router,
-# not the sole level authority; recovery comes from the latest edit author.
+relay_bridge = Path("scripts/patch_v4_relay_anchor_bridge.py")
+if not relay_bridge.exists():
+    raise SystemExit("v4 relay anchor bridge patch missing")
+exec(compile(relay_bridge.read_text(encoding="utf-8"), str(relay_bridge), "exec"), {"__name__": "__main__"})
+
 v4_patch = Path("scripts/patch_global_shared_state_v4.py")
 if not v4_patch.exists():
     raise SystemExit("global shared state v4 patch missing")
 exec(compile(v4_patch.read_text(encoding="utf-8"), str(v4_patch), "exec"), {"__name__": "__main__"})
 
-# Final source markers + strong self-check before CMake.
 finalize_patch = Path("scripts/patch_finalize_release.py")
 if not finalize_patch.exists():
     raise SystemExit("final release verification patch missing")

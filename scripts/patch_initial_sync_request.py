@@ -94,6 +94,13 @@ hooks_path.write_text(hooks, encoding="utf-8")
 
 print("Patched first-join bootstrap to explicit InitialSyncRequest -> authoritative SyncLevel")
 
+# Normalize the anonymous-namespace anchor after ProcessingRemoteGuard so the
+# RAW bulk-paste patch can be applied deterministically after all earlier layers.
+bridge_patch = Path("scripts/patch_raw_bulk_anchor_bridge.py")
+if not bridge_patch.exists():
+    raise SystemExit("raw bulk anchor bridge patch missing")
+exec(compile(bridge_patch.read_text(encoding="utf-8"), str(bridge_patch), "exec"), {"__name__": "__main__"})
+
 # Apply the exact/raw Object Workshop bulk-paste protocol.
 raw_patch = Path("scripts/patch_raw_bulk_paste_v3.py")
 if not raw_patch.exists():

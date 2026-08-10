@@ -27,6 +27,7 @@ jobs:
           python -m py_compile scripts/patch_integrity_compile_fix.py
           python -m py_compile scripts/patch_handshake_finalize.py
           python -m py_compile scripts/patch_initial_sync_always_full.py
+          python -m py_compile scripts/patch_initial_sync_request.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -64,6 +65,9 @@ jobs:
       - name: Force authoritative initial level sync
         run: python scripts/patch_initial_sync_always_full.py
 
+      - name: Make first-join sync request-driven
+        run: python scripts/patch_initial_sync_request.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -94,12 +98,14 @@ jobs:
           if (-not $p2p.Contains("finalizePeerHandshake")) { throw "protocol-gated peer finalize missing" }
           if (-not $p2p.Contains("waiting for protocol handshake")) { throw "transport-ready/protocol-ready split missing" }
           if (-not $p2p.Contains("releasing {} pending messages")) { throw "pending release after handshake missing" }
+          if (-not $p2p.Contains("requested authoritative initial sync from host")) { throw "client first-join sync request missing" }
           if (-not $p2pHeader.Contains("connectionAnnounced")) { throw "single peer announcement guard missing" }
           if (-not $p2pHeader.Contains("pendingReliableAcks")) { throw "pending ACK state missing" }
           if (-not $p2pHeader.Contains("receivedReliableSequences")) { throw "dedup state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
           if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
           if (-not $protoHeader.Contains("ProtocolHello")) { throw "ProtocolHello opcode missing" }
+          if (-not $protoHeader.Contains("InitialSyncRequest")) { throw "InitialSyncRequest opcode missing" }
           if (-not $protoHeader.Contains("LevelDigest")) { throw "level digest protocol missing" }
           if (-not $protoHeader.Contains("LevelManifest")) { throw "level manifest protocol missing" }
           if (-not $protoHeader.Contains("LevelRepairRequest")) { throw "targeted repair protocol missing" }
@@ -108,8 +114,9 @@ jobs:
           if (-not $hooks.Contains("MAX_CHUNK_BYTES = 12000")) { throw "safe full-level sync chunk bytes missing" }
           if (-not $hooks.Contains("MAX_UUIDS_PER_CHUNK = 250")) { throw "safe full-level UUID chunk size missing" }
           if (-not $hooks.Contains("m_integrityCheckTimer")) { throw "periodic integrity timer missing" }
-          if (-not $hooks.Contains("authoritative initial sync_level")) { throw "authoritative initial full sync missing" }
           if ($hooks.Contains("waiting for digest before repair/resync")) { throw "reconnect still skips initial SyncLevel" }
+          if ($hooks.Contains("Sent authoritative initial sync_level")) { throw "push-based first-join sync still active" }
+          if (-not $hooks.Contains("request-driven after ProtocolHello")) { throw "request-driven bootstrap marker missing" }
           if (-not $hooks.Contains("sendFullLevelSyncTo")) { throw "full SyncLevel fallback helper missing" }
           if (-not $hooks.Contains(":music:")) { throw "player music status suffix missing" }
           if (-not $hooks.Contains("m_externalCompatScanTimer")) { throw "external editor compatibility scan missing" }
@@ -118,6 +125,7 @@ jobs:
           if (-not $hooks.Contains("s_inBulkPasteSync")) { throw "bulk paste guard missing" }
           if (-not $hooks.Contains("pasteObjects(gd::string")) { throw "EditorUI pasteObjects hook missing" }
           if (-not $hooks.Contains("bulk paste synced")) { throw "finalized bulk paste send missing" }
+          if (-not $remote.Contains("InitialSyncRequest from player")) { throw "host first-join sync handler missing" }
           if (-not $remote.Contains("stableIntegrityHash")) { throw "stable level hash missing" }
           if (-not $remote.Contains("kA21")) { throw "StartPos hash normalization missing" }
           if (-not $remote.Contains("LEVEL HASH mismatch")) { throw "digest comparison missing" }

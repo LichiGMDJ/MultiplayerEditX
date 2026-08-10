@@ -19,6 +19,8 @@ jobs:
           python -m py_compile scripts/patch_external_editor_sync.py
           python -m py_compile scripts/patch_bulk_paste_sync.py
           python -m py_compile scripts/patch_bulk_transport_queue.py
+          python -m py_compile scripts/patch_reliable_editor_retry.py
+          python -m py_compile scripts/patch_processing_remote_guard.py
 
       - name: Apply 0.5.1 safety patch
         run: python scripts/patch_turn_udp.py
@@ -32,6 +34,12 @@ jobs:
       - name: Apply paced bulk transport patch
         run: python scripts/patch_bulk_transport_queue.py
 
+      - name: Apply reliable editor retry patch
+        run: python scripts/patch_reliable_editor_retry.py
+
+      - name: Apply remote-processing RAII guard
+        run: python scripts/patch_processing_remote_guard.py
+
       - name: Verify patched source markers
         shell: pwsh
         run: |
@@ -39,6 +47,7 @@ jobs:
           $p2pHeader = Get-Content src/P2PManager.hpp -Raw
           $protoHeader = Get-Content src/BinaryProtocol.hpp -Raw
           $hooks = Get-Content src/EditorHooks.cpp -Raw
+          $remote = Get-Content src/RemoteActionHandler.cpp -Raw
           $cursor = Get-Content src/ui/CursorNode.cpp -Raw
 
           if (-not $p2p.Contains("kSafeMessageBytes = 24 * 1024")) { throw "paced SCTP packet size missing" }
@@ -48,6 +57,7 @@ jobs:
           if (-not $p2p.Contains("replaying {} buffered packets")) { throw "pre-handshake replay logic missing" }
           if (-not $p2p.Contains("flushBulkReliableQueues")) { throw "bulk queue drain missing" }
           if (-not $p2p.Contains("bulk send deferred")) { throw "bulk retry path missing" }
+          if (-not $p2p.Contains("queued failed reliable opcode")) { throw "small reliable retry path missing" }
           if (-not $p2pHeader.Contains("bulkReliableQueue")) { throw "bulk reliable queue state missing" }
           if (-not $p2pHeader.Contains("protocolVerified")) { throw "peer protocol verification state missing" }
           if (-not $p2pHeader.Contains("preHandshakeMessages")) { throw "pre-handshake packet buffer missing" }
@@ -60,6 +70,8 @@ jobs:
           if (-not $hooks.Contains("s_inBulkPasteSync")) { throw "bulk paste guard missing" }
           if (-not $hooks.Contains("pasteObjects(gd::string")) { throw "EditorUI pasteObjects hook missing" }
           if (-not $hooks.Contains("bulk paste synced")) { throw "finalized bulk paste send missing" }
+          if (-not $remote.Contains("struct ProcessingRemoteGuard")) { throw "remote-processing RAII guard missing" }
+          if (-not $remote.Contains("ProcessingRemoteGuard processingRemoteGuard")) { throw "remote handlers are not guarded" }
           if (-not $cursor.Contains("LevelTools::getSongObject")) { throw "custom song title lookup missing" }
           if (-not $cursor.Contains("LevelTools::getAudioTitle")) { throw "official song title lookup missing" }
 

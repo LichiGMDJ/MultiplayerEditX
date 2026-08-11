@@ -131,9 +131,14 @@ cpp = replace_once(
     }''',
     '''    void MultiplayerPopup::pollNetwork(float dt) {
         auto& net = P2PManager::get();
-        net.dispatchMessages();
 
-        if (!m_connectionPending || !m_statusLabel) return;
+        // dispatchMessages() can synchronously invoke callbacks that rebuild or
+        // close this popup. Therefore all optional UI access must happen before
+        // dispatch, and dispatch must be the final operation in this timer tick.
+        if (!m_connectionPending || !m_statusLabel) {
+            net.dispatchMessages();
+            return;
+        }
 
         m_connectionElapsed += dt;
         auto state = net.getState();
@@ -191,11 +196,35 @@ cpp = replace_once(
         m_statusLabel->setString(text.c_str());
         m_statusLabel->setColor(color);
         m_statusLabel->setScale(text.find('\\n') == std::string::npos ? 0.55f : 0.44f);
+
+        // Must remain last. A callback reached from here may destroy the popup.
+        net.dispatchMessages();
     }''',
     "pollNetwork staged diagnostics",
 )
 
 cpp_path.write_text(cpp, encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+# SessionStatusNode lifetime guard.
+# A scheduled update during editor/scene teardown must not mutate a BMFont label
+# after its node has left the running scene. The reported crash signature ends
+# in CCLabelBMFont::setColor from a CCTimer tick, so guard this second status UI.
+# -----------------------------------------------------------------------------
+status_path = Path("src/ui/SessionStatusNode.cpp")
+status = status_path.read_text(encoding="utf-8")
+status = replace_once(
+    status,
+    '''    void SessionStatusNode::update(float dt) {
+        auto& session = SessionManager::get();''',
+    '''    void SessionStatusNode::update(float dt) {
+        if (!this->isRunning() || !m_statusLabel) return;
+
+        auto& session = SessionManager::get();''',
+    "session status teardown guard",
+)
+status_path.write_text(status, encoding="utf-8")
 
 checks = [
     (room_path, "maxButtonHalfGap = 34.f"),
@@ -204,10 +233,11 @@ checks = [
     (cpp_path, "Stage 2/4: WebRTC - ICE / STUN / TURN negotiation"),
     (cpp_path, "Stage 3/4: P2P connected - waiting for level sync"),
     (cpp_path, "Taking unusually long - check TURN password / network"),
-    (cpp_path, "connection diagnostic stage="),
+    (cpp_path, "Must remain last. A callback reached from here may destroy the popup"),
+    (status_path, "if (!this->isRunning() || !m_statusLabel) return;"),
 ]
 for path, marker in checks:
     if marker not in path.read_text(encoding="utf-8"):
         raise SystemExit(f"v0.5.2 connection diagnostics self-check failed: {path}: {marker}")
 
-print("Patched v0.5.2 final UX: staged connection diagnostics + symmetric Max Players buttons")
+print("Patched v0.5.2 final UX: staged diagnostics + UI lifetime guards + symmetric Max Players buttons")

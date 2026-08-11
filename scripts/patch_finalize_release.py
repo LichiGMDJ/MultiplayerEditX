@@ -19,9 +19,13 @@ if "legacy workflow marker: LEVEL HASH mismatch" not in remote:
     remote += "\n// legacy workflow marker: LEVEL HASH mismatch\n"
 remote_path.write_text(remote, encoding="utf-8")
 
-# v0.5.2 stabilization is applied exactly once by patch_initial_sync_request.py
-# immediately before this final verification step. Do not execute another sync
-# safety patch here: doing so would try to patch already-transformed anchors.
+# The stabilization patch is applied by patch_initial_sync_request.py. Apply the
+# second-stage 0.5.2 hardening exactly once here, after every protocol/feature
+# patch has produced the final generated C++ source.
+hardening_path = Path("scripts/patch_v052_hardening.py")
+if not hardening_path.exists():
+    raise SystemExit("v0.5.2 hardening patch missing")
+exec(compile(hardening_path.read_text(encoding="utf-8"), str(hardening_path), "exec"), {"__name__": "__main__"})
 
 checks = [
     ("src/P2PManager.cpp", "kProtocolVersion = 6", "Protocol v6 missing"),
@@ -50,6 +54,8 @@ checks = [
     ("src/EditorHooks.cpp", "m_integrityCheckTimer >= 20.0f", "0.5.2 integrity cadence missing"),
     ("src/EditorHooks.cpp", "applying deferred SyncLevel after playtest ended", "0.5.2 deferred sync application missing"),
     ("src/EditorHooks.cpp", "currentMusicTitle", "0.5.2 transmitted cursor music title missing"),
+    ("src/EditorHooks.cpp", "Always register it before storing its full serialized state", "0.5.2 StartPos cache hardening missing"),
+    ("src/ActionSerializer.cpp", "StartPos configuration is authoritative shared editor state", "0.5.2 authoritative StartPos serialization missing"),
     ("src/RemoteActionHandler.cpp", "anchor corrected by", "Object Workshop positional correction missing"),
     ("src/RemoteActionHandler.cpp", "Host changed music:", "guest music notification missing"),
     ("src/RemoteActionHandler.cpp", "AUTO REPAIR disabled", "Auto Repair toggle missing"),
@@ -57,6 +63,10 @@ checks = [
     ("src/RemoteActionHandler.cpp", "GLOBAL SNAPSHOT", "last-author snapshot recovery missing"),
     ("src/RemoteActionHandler.cpp", "using targeted repair instead of automatic SyncLevel", "0.5.2 destructive resync suppression missing"),
     ("src/RemoteActionHandler.cpp", "SyncLevel deferred until playtest ends", "0.5.2 playtest sync deferral missing"),
+    ("src/RemoteActionHandler.cpp", "rejected SyncLevelStart with unsafe bounds", "0.5.2 snapshot bounds missing"),
+    ("src/RemoteActionHandler.cpp", "refusing destructive SyncLevel because serialized object count", "0.5.2 snapshot validation missing"),
+    ("src/RemoteActionHandler.cpp", "snapshot mapping incomplete", "0.5.2 robust UUID remapping missing"),
+    ("src/RemoteActionHandler.cpp", "loadSettingsFromString(serializedObjects[i])", "0.5.2 StartPos full-sync restoration missing"),
     ("src/ui/CursorNode.cpp", "transmittedTitle", "0.5.2 cursor music receiver missing"),
     ("src/ui/MultiplayerPopup.cpp", "MultiplayerPopup::onKick", "host kick UI callback missing"),
     ("src/ui/MultiplayerPopup.cpp", "room-settings-button", "Room Settings button missing"),
@@ -70,4 +80,4 @@ for filename, marker, error in checks:
     if marker not in text:
         raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
 
-print("Final v6/0.5.2 self-check passed: safer recovery, deferred sync, cursor music, Room Settings, permissions, global state and kick are present")
+print("Final v6/0.5.2 hardening self-check passed: StartPos/trigger state, bounded snapshots, safer recovery, deferred sync, cursor music, Room Settings and global state are present")

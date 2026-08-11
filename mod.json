@@ -7,10 +7,10 @@
         "ios": "2.2081"
     },
     "id": "lichigmdj.multiplayereditx",
-    "name": "Multiplayer Edit",
+    "name": "Multiplayer Edit X",
     "version": "0.5.1",
     "developer": "LichiGMDJ",
-    "description": "Fork of Multiplayer Edit by xXoanon. Collaborate with friends in real-time level editing, host a session, and build together.",
+    "description": "Fork of Multiplayer Edit by xXoanon, extended with Android support, cross-platform multiplayer improvements, Room Settings, and networking reliability fixes.",
     "links": {
         "source": "https://github.com/LichiGMDJ/MultiplayerEditX"
     },

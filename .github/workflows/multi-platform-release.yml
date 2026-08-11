@@ -56,6 +56,7 @@ jobs:
           python -m py_compile scripts/patch_room_settings_layout.py
           python -m py_compile scripts/patch_auto_ice_fallback.py
           python -m py_compile scripts/patch_v052_stability.py
+          python -m py_compile scripts/patch_v052_hardening.py
           python -m py_compile scripts/patch_finalize_release.py
 
       - name: Apply base transport patch chain
@@ -96,6 +97,7 @@ jobs:
           proto = Path('src/BinaryProtocol.hpp').read_text(encoding='utf-8')
           hooks = Path('src/EditorHooks.cpp').read_text(encoding='utf-8')
           remote = Path('src/RemoteActionHandler.cpp').read_text(encoding='utf-8')
+          action = Path('src/ActionSerializer.cpp').read_text(encoding='utf-8')
           cursor = Path('src/ui/CursorNode.cpp').read_text(encoding='utf-8')
           assert 'kProtocolVersion = 6' in p2p, 'Protocol v6 missing'
           assert 'ICE auto mode: direct/STUN preferred, TURN fallback available' in p2p, 'ICE auto mode missing'
@@ -103,10 +105,16 @@ jobs:
           assert 'RoomSettingsChanged' in proto, 'Room Settings protocol missing'
           assert 'm_integrityCheckTimer >= 20.0f' in hooks, 'v0.5.2 integrity interval missing'
           assert 'applying deferred SyncLevel after playtest ended' in hooks, 'deferred SyncLevel guard missing'
+          assert 'Always register it before storing its full serialized state' in hooks, 'StartPos cache hardening missing'
+          assert 'StartPos configuration is authoritative shared editor state' in action, 'StartPos serialization hardening missing'
           assert 'using targeted repair instead of automatic SyncLevel' in remote, 'non-destructive repair policy missing'
           assert 'SyncLevel deferred until playtest ends' in remote, 'playtest SyncLevel guard missing'
+          assert 'rejected SyncLevelStart with unsafe bounds' in remote, 'snapshot bounds missing'
+          assert 'refusing destructive SyncLevel because serialized object count' in remote, 'snapshot validation missing'
+          assert 'snapshot mapping incomplete' in remote, 'robust UUID mapping missing'
+          assert 'loadSettingsFromString(serializedObjects[i])' in remote, 'StartPos full-sync restoration missing'
           assert 'transmittedTitle' in cursor, 'cursor music title fix missing'
-          print('Multi-platform v0.5.2 release verification passed')
+          print('Multi-platform v0.5.2 hardening verification passed')
           PY
 
       - name: Build ${{ matrix.config.name }} for combine

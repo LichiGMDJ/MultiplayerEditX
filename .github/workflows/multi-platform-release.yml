@@ -104,6 +104,7 @@ jobs:
           room = Path('src/ui/RoomSettingsPopup.cpp').read_text(encoding='utf-8')
           popup = Path('src/ui/MultiplayerPopup.cpp').read_text(encoding='utf-8')
           popup_hpp = Path('src/ui/MultiplayerPopup.hpp').read_text(encoding='utf-8')
+          status = Path('src/ui/SessionStatusNode.cpp').read_text(encoding='utf-8')
           assert 'kProtocolVersion = 6' in p2p, 'Protocol v6 missing'
           assert 'ICE auto mode: direct/STUN preferred, TURN fallback available' in p2p, 'ICE auto mode missing'
           assert 'InitialSyncRequest' in proto, 'Initial sync protocol missing'
@@ -128,6 +129,8 @@ jobs:
           assert 'Stage 2/4: WebRTC - ICE / STUN / TURN negotiation' in popup, 'ICE stage missing'
           assert 'Stage 3/4: P2P connected - waiting for level sync' in popup, 'P2P stage missing'
           assert 'Taking unusually long - check TURN password / network' in popup, 'connection timeout hint missing'
+          assert 'Must remain last. A callback reached from here may destroy the popup' in popup, 'popup post-dispatch lifetime guard missing'
+          assert 'if (!this->isRunning() || !m_statusLabel) return;' in status, 'session status teardown guard missing'
           print('Multi-platform v0.5.2 final verification passed')
           PY
 

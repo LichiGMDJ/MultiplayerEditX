@@ -27,12 +27,19 @@ if not hardening_path.exists():
     raise SystemExit("v0.5.2 hardening patch missing")
 exec(compile(hardening_path.read_text(encoding="utf-8"), str(hardening_path), "exec"), {"__name__": "__main__"})
 
-# Final visual/audio polish is deliberately last: it only adjusts generated UI
+# Final visual/audio polish is deliberately late: it only adjusts generated UI
 # geometry and contains unauthorized guest song previews. No wire format changes.
 ui_music_path = Path("scripts/patch_v052_ui_music.py")
 if not ui_music_path.exists():
     raise SystemExit("v0.5.2 UI/music patch missing")
 exec(compile(ui_music_path.read_text(encoding="utf-8"), str(ui_music_path), "exec"), {"__name__": "__main__"})
+
+# Last UX pass: staged connection diagnostics and final +/- spacing. This runs
+# after UI/music so its geometry anchors match the final Room Settings source.
+connection_diag_path = Path("scripts/patch_v052_connection_diagnostics.py")
+if not connection_diag_path.exists():
+    raise SystemExit("v0.5.2 connection diagnostics patch missing")
+exec(compile(connection_diag_path.read_text(encoding="utf-8"), str(connection_diag_path), "exec"), {"__name__": "__main__"})
 
 checks = [
     ("src/P2PManager.cpp", "kProtocolVersion = 6", "Protocol v6 missing"),
@@ -79,8 +86,12 @@ checks = [
     ("src/ui/CursorNode.cpp", "transmittedTitle", "0.5.2 cursor music receiver missing"),
     ("src/ui/MultiplayerPopup.cpp", "MultiplayerPopup::onKick", "host kick UI callback missing"),
     ("src/ui/MultiplayerPopup.cpp", "room-settings-button", "Room Settings button missing"),
+    ("src/ui/MultiplayerPopup.cpp", "Stage 1/4: Signaling - joining room", "staged signaling diagnostics missing"),
+    ("src/ui/MultiplayerPopup.cpp", "Stage 2/4: WebRTC - ICE / STUN / TURN negotiation", "WebRTC diagnostics missing"),
+    ("src/ui/MultiplayerPopup.cpp", "Stage 3/4: P2P connected - waiting for level sync", "P2P sync diagnostics missing"),
+    ("src/ui/MultiplayerPopup.cpp", "Taking unusually long - check TURN password / network", "connection timeout hint missing"),
     ("src/ui/RoomSettingsPopup.cpp", "constexpr float rightButtonX = 346.f", "Room Settings compact right column missing"),
-    ("src/ui/RoomSettingsPopup.cpp", "center.width + 62.f", "Room Settings max-player spacing missing"),
+    ("src/ui/RoomSettingsPopup.cpp", "maxButtonHalfGap = 34.f", "Room Settings final max-player spacing missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Force TURN (host)", "Room Settings Force TURN toggle missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Lock room", "Room Settings lock toggle missing"),
 ]
@@ -90,4 +101,4 @@ for filename, marker, error in checks:
     if marker not in text:
         raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
 
-print("Final v6/0.5.2 hardening self-check passed: level state, bounded snapshots, safer recovery, guest music containment, polished Room Settings and global state are present")
+print("Final v6/0.5.2 self-check passed: hardening, staged connection diagnostics, guest music containment, polished Room Settings and global state are present")

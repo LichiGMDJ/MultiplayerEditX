@@ -174,7 +174,7 @@ cpp = replace_once(
 
         if (m_connectionElapsed >= 20.f &&
             (state == P2PManager::State::Connecting || state == P2PManager::State::Reconnecting)) {
-            text += "\nTaking unusually long - check TURN password / network";
+            text += "\\nTaking unusually long - check TURN password / network";
             color = {255, 190, 90};
         }
 

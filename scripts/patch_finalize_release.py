@@ -34,8 +34,8 @@ if not ui_music_path.exists():
     raise SystemExit("v0.5.2 UI/music patch missing")
 exec(compile(ui_music_path.read_text(encoding="utf-8"), str(ui_music_path), "exec"), {"__name__": "__main__"})
 
-# Last UX pass: staged connection diagnostics and final +/- spacing. This runs
-# after UI/music so its geometry anchors match the final Room Settings source.
+# Last UX pass: staged connection diagnostics, UI lifetime guards, and final
+# +/- spacing. This runs after UI/music so its anchors match generated source.
 connection_diag_path = Path("scripts/patch_v052_connection_diagnostics.py")
 if not connection_diag_path.exists():
     raise SystemExit("v0.5.2 connection diagnostics patch missing")
@@ -90,6 +90,8 @@ checks = [
     ("src/ui/MultiplayerPopup.cpp", "Stage 2/4: WebRTC - ICE / STUN / TURN negotiation", "WebRTC diagnostics missing"),
     ("src/ui/MultiplayerPopup.cpp", "Stage 3/4: P2P connected - waiting for level sync", "P2P sync diagnostics missing"),
     ("src/ui/MultiplayerPopup.cpp", "Taking unusually long - check TURN password / network", "connection timeout hint missing"),
+    ("src/ui/MultiplayerPopup.cpp", "Must remain last. A callback reached from here may destroy the popup", "popup post-dispatch lifetime guard missing"),
+    ("src/ui/SessionStatusNode.cpp", "if (!this->isRunning() || !m_statusLabel) return;", "session status teardown guard missing"),
     ("src/ui/RoomSettingsPopup.cpp", "constexpr float rightButtonX = 346.f", "Room Settings compact right column missing"),
     ("src/ui/RoomSettingsPopup.cpp", "maxButtonHalfGap = 34.f", "Room Settings final max-player spacing missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Force TURN (host)", "Room Settings Force TURN toggle missing"),
@@ -101,4 +103,4 @@ for filename, marker, error in checks:
     if marker not in text:
         raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
 
-print("Final v6/0.5.2 self-check passed: hardening, staged connection diagnostics, guest music containment, polished Room Settings and global state are present")
+print("Final v6/0.5.2 self-check passed: hardening, staged connection diagnostics, UI lifetime guards, guest music containment, polished Room Settings and global state are present")

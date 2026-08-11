@@ -19,6 +19,14 @@ if "legacy workflow marker: LEVEL HASH mismatch" not in remote:
     remote += "\n// legacy workflow marker: LEVEL HASH mismatch\n"
 remote_path.write_text(remote, encoding="utf-8")
 
+# 0.5.2 bugfix layer is intentionally applied after the stable v6 feature
+# patches, so it only narrows destructive recovery behavior without changing
+# packet formats or the proven editor synchronization protocol.
+bugfix_path = Path("scripts/patch_052_sync_safety.py")
+if not bugfix_path.exists():
+    raise SystemExit("0.5.2 sync safety patch missing")
+exec(compile(bugfix_path.read_text(encoding="utf-8"), str(bugfix_path), "exec"), {"__name__": "__main__"})
+
 checks = [
     ("src/P2PManager.cpp", "kProtocolVersion = 6", "Protocol v6 missing"),
     ("src/P2PManager.cpp", "GLOBAL REV", "global revision sequencer missing"),
@@ -43,11 +51,14 @@ checks = [
     ("src/EditorHooks.cpp", "Host disabled guest deletion", "local delete permission UX missing"),
     ("src/EditorHooks.cpp", "Host disabled Object Workshop", "local workshop permission UX missing"),
     ("src/EditorHooks.cpp", "Host disabled guest level settings", "local level settings permission UX missing"),
+    ("src/EditorHooks.cpp", "m_integrityCheckTimer >= 15.0f", "0.5.2 integrity cadence missing"),
     ("src/RemoteActionHandler.cpp", "anchor corrected by", "Object Workshop positional correction missing"),
     ("src/RemoteActionHandler.cpp", "Host changed music:", "guest music notification missing"),
     ("src/RemoteActionHandler.cpp", "AUTO REPAIR disabled", "Auto Repair toggle missing"),
     ("src/RemoteActionHandler.cpp", "GLOBAL RECOVERY", "global convergence recovery missing"),
     ("src/RemoteActionHandler.cpp", "GLOBAL SNAPSHOT", "last-author snapshot recovery missing"),
+    ("src/RemoteActionHandler.cpp", "automatic full SyncLevel suppressed", "0.5.2 destructive resync suppression missing"),
+    ("src/RemoteActionHandler.cpp", "full SyncLevel ignored during playtest for collision safety", "0.5.2 playtest sync guard missing"),
     ("src/ui/MultiplayerPopup.cpp", "MultiplayerPopup::onKick", "host kick UI callback missing"),
     ("src/ui/MultiplayerPopup.cpp", "room-settings-button", "Room Settings button missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Max players", "Room Settings popup missing max players"),
@@ -60,4 +71,4 @@ for filename, marker, error in checks:
     if marker not in text:
         raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
 
-print("Final v6 self-check passed: Room Settings, permissions, v5 features, global state and kick are present")
+print("Final v6/0.5.2 self-check passed: sync safety, Room Settings, permissions, v5 features, global state and kick are present")

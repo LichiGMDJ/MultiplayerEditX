@@ -55,6 +55,7 @@ jobs:
           python -m py_compile scripts/patch_room_settings_v6.py
           python -m py_compile scripts/patch_room_settings_layout.py
           python -m py_compile scripts/patch_auto_ice_fallback.py
+          python -m py_compile scripts/patch_v052_stability.py
           python -m py_compile scripts/patch_finalize_release.py
 
       - name: Apply base transport patch chain
@@ -86,17 +87,26 @@ jobs:
 
           mod = json.loads(Path('mod.json').read_text(encoding='utf-8'))
           assert mod.get('id') == 'lichigmdj.multiplayereditx', 'Unexpected mod ID'
-          assert mod.get('version') == '0.5.1', 'Unexpected release version'
+          assert mod.get('name') == 'Multiplayer Edit X', 'Unexpected mod name'
+          assert mod.get('version') == '0.5.2', 'Unexpected release version'
           assert mod.get('gd', {}).get('win') == '2.2081', 'Win64 GD target missing'
           assert mod.get('gd', {}).get('android') == '2.2081', 'Android64 GD target missing'
 
           p2p = Path('src/P2PManager.cpp').read_text(encoding='utf-8')
           proto = Path('src/BinaryProtocol.hpp').read_text(encoding='utf-8')
+          hooks = Path('src/EditorHooks.cpp').read_text(encoding='utf-8')
+          remote = Path('src/RemoteActionHandler.cpp').read_text(encoding='utf-8')
+          cursor = Path('src/ui/CursorNode.cpp').read_text(encoding='utf-8')
           assert 'kProtocolVersion = 6' in p2p, 'Protocol v6 missing'
           assert 'ICE auto mode: direct/STUN preferred, TURN fallback available' in p2p, 'ICE auto mode missing'
           assert 'InitialSyncRequest' in proto, 'Initial sync protocol missing'
           assert 'RoomSettingsChanged' in proto, 'Room Settings protocol missing'
-          print('Multi-platform release verification passed')
+          assert 'm_integrityCheckTimer >= 20.0f' in hooks, 'v0.5.2 integrity interval missing'
+          assert 'applying deferred SyncLevel after playtest ended' in hooks, 'deferred SyncLevel guard missing'
+          assert 'using targeted repair instead of automatic SyncLevel' in remote, 'non-destructive repair policy missing'
+          assert 'SyncLevel deferred until playtest ends' in remote, 'playtest SyncLevel guard missing'
+          assert 'transmittedTitle' in cursor, 'cursor music title fix missing'
+          print('Multi-platform v0.5.2 release verification passed')
           PY
 
       - name: Build ${{ matrix.config.name }} for combine
@@ -123,13 +133,13 @@ jobs:
       - name: Upload unified .geode
         uses: actions/upload-artifact@v4
         with:
-          name: lichigmdj.multiplayereditx-0.5.1-multiplatform
+          name: lichigmdj.multiplayereditx-0.5.2-multiplatform
           path: ${{ steps.combine.outputs.build-output }}
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          name: Multiplayer Edit v0.5.1
+          name: Multiplayer Edit X v0.5.2
           generate_release_notes: true
           files: ${{ steps.combine.outputs.build-output }}

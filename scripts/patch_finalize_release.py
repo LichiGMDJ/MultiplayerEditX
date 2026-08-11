@@ -27,6 +27,13 @@ if not hardening_path.exists():
     raise SystemExit("v0.5.2 hardening patch missing")
 exec(compile(hardening_path.read_text(encoding="utf-8"), str(hardening_path), "exec"), {"__name__": "__main__"})
 
+# Final visual/audio polish is deliberately last: it only adjusts generated UI
+# geometry and contains unauthorized guest song previews. No wire format changes.
+ui_music_path = Path("scripts/patch_v052_ui_music.py")
+if not ui_music_path.exists():
+    raise SystemExit("v0.5.2 UI/music patch missing")
+exec(compile(ui_music_path.read_text(encoding="utf-8"), str(ui_music_path), "exec"), {"__name__": "__main__"})
+
 checks = [
     ("src/P2PManager.cpp", "kProtocolVersion = 6", "Protocol v6 missing"),
     ("src/P2PManager.cpp", "GLOBAL REV", "global revision sequencer missing"),
@@ -47,6 +54,8 @@ checks = [
     ("src/BinaryProtocol.hpp", "RoomSettingsChanged", "RoomSettingsChanged protocol missing"),
     ("src/EditorHooks.cpp", "pasteAnchorX", "Object Workshop positional anchor sender missing"),
     ("src/EditorHooks.cpp", "Only the host can change music", "host-only music guard missing"),
+    ("src/EditorHooks.cpp", "blocked guest music change and stopped unauthorized preview", "guest music preview containment missing"),
+    ("src/EditorHooks.cpp", "Prevent a guest-selected editor preview from leaking", "guest music exit cleanup missing"),
     ("src/EditorHooks.cpp", "Host disabled guest building", "local build permission UX missing"),
     ("src/EditorHooks.cpp", "Host disabled guest deletion", "local delete permission UX missing"),
     ("src/EditorHooks.cpp", "Host disabled Object Workshop", "local workshop permission UX missing"),
@@ -70,7 +79,8 @@ checks = [
     ("src/ui/CursorNode.cpp", "transmittedTitle", "0.5.2 cursor music receiver missing"),
     ("src/ui/MultiplayerPopup.cpp", "MultiplayerPopup::onKick", "host kick UI callback missing"),
     ("src/ui/MultiplayerPopup.cpp", "room-settings-button", "Room Settings button missing"),
-    ("src/ui/RoomSettingsPopup.cpp", "Max players", "Room Settings popup missing max players"),
+    ("src/ui/RoomSettingsPopup.cpp", "constexpr float rightButtonX = 346.f", "Room Settings compact right column missing"),
+    ("src/ui/RoomSettingsPopup.cpp", "center.width + 62.f", "Room Settings max-player spacing missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Force TURN (host)", "Room Settings Force TURN toggle missing"),
     ("src/ui/RoomSettingsPopup.cpp", "Lock room", "Room Settings lock toggle missing"),
 ]
@@ -80,4 +90,4 @@ for filename, marker, error in checks:
     if marker not in text:
         raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
 
-print("Final v6/0.5.2 hardening self-check passed: StartPos/trigger state, bounded snapshots, safer recovery, deferred sync, cursor music, Room Settings and global state are present")
+print("Final v6/0.5.2 hardening self-check passed: level state, bounded snapshots, safer recovery, guest music containment, polished Room Settings and global state are present")

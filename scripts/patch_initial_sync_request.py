@@ -88,6 +88,7 @@ for script, missing in [
     ("scripts/patch_room_settings_v6.py", "Room Settings v6 patch missing"),
     ("scripts/patch_room_settings_layout.py", "Room Settings layout patch missing"),
     ("scripts/patch_auto_ice_fallback.py", "automatic ICE fallback patch missing"),
+    ("scripts/patch_v052_stability.py", "v0.5.2 stabilization patch missing"),
     ("scripts/patch_finalize_release.py", "final release verification patch missing"),
 ]:
     path = Path(script)

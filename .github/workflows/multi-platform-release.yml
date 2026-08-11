@@ -58,6 +58,7 @@ jobs:
           python -m py_compile scripts/patch_v052_stability.py
           python -m py_compile scripts/patch_v052_hardening.py
           python -m py_compile scripts/patch_v052_ui_music.py
+          python -m py_compile scripts/patch_v052_connection_diagnostics.py
           python -m py_compile scripts/patch_finalize_release.py
 
       - name: Apply base transport patch chain
@@ -101,6 +102,8 @@ jobs:
           action = Path('src/ActionSerializer.cpp').read_text(encoding='utf-8')
           cursor = Path('src/ui/CursorNode.cpp').read_text(encoding='utf-8')
           room = Path('src/ui/RoomSettingsPopup.cpp').read_text(encoding='utf-8')
+          popup = Path('src/ui/MultiplayerPopup.cpp').read_text(encoding='utf-8')
+          popup_hpp = Path('src/ui/MultiplayerPopup.hpp').read_text(encoding='utf-8')
           assert 'kProtocolVersion = 6' in p2p, 'Protocol v6 missing'
           assert 'ICE auto mode: direct/STUN preferred, TURN fallback available' in p2p, 'ICE auto mode missing'
           assert 'InitialSyncRequest' in proto, 'Initial sync protocol missing'
@@ -119,8 +122,13 @@ jobs:
           assert 'loadSettingsFromString(serializedObjects[i])' in remote, 'StartPos full-sync restoration missing'
           assert 'transmittedTitle' in cursor, 'cursor music title fix missing'
           assert 'constexpr float rightButtonX = 346.f' in room, 'Room Settings compact right column missing'
-          assert 'center.width + 62.f' in room, 'Max-player button spacing missing'
-          print('Multi-platform v0.5.2 hardening verification passed')
+          assert 'maxButtonHalfGap = 34.f' in room, 'Max-player symmetric spacing missing'
+          assert 'm_connectionElapsed' in popup_hpp, 'connection diagnostic state missing'
+          assert 'Stage 1/4: Signaling - joining room' in popup, 'signaling stage missing'
+          assert 'Stage 2/4: WebRTC - ICE / STUN / TURN negotiation' in popup, 'ICE stage missing'
+          assert 'Stage 3/4: P2P connected - waiting for level sync' in popup, 'P2P stage missing'
+          assert 'Taking unusually long - check TURN password / network' in popup, 'connection timeout hint missing'
+          print('Multi-platform v0.5.2 final verification passed')
           PY
 
       - name: Build ${{ matrix.config.name }} for combine

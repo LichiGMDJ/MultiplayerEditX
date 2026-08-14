@@ -1,0 +1,33 @@
+name: Fix signaling typecheck
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/fix_signaling_typecheck.py'
+      - '.github/workflows/fix-signaling-typecheck.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply fix
+        run: python tools/fix_signaling_typecheck.py
+      - name: Validate source pattern
+        run: |
+          grep -q 'const normalized: SignalMessage' server/signaling/server.ts
+          ! grep -q 'delete normalized.targetPlayerId' server/signaling/server.ts
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server/signaling/server.ts
+          git commit -m 'fix: make signaling forwarding type-safe' || exit 0
+          git push origin main

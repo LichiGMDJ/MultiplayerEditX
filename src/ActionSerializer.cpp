@@ -96,24 +96,13 @@ namespace mpedit::ActionSerializer {
     }
 
     void injectLocalStartPosState(ObjectData& remoteData, GameObject* localObj) {
-        if (!localObj || remoteData.objectID != 31 || remoteData.saveString.empty()) return;
-        
-        if (auto* editor = LevelEditorLayer::get()) {
-            auto localMap = parseSaveString(localObj->getSaveString(editor));
-            auto remoteVec = parseSaveStringOrdered(remoteData.saveString);
-            
-            std::vector<std::pair<std::string, std::string>> newRemoteVec;
-            for (auto const& p : remoteVec) {
-                if (p.first == "kA21" || p.first == "kA9" || p.first == "93") continue;
-                newRemoteVec.push_back(p);
-            }
-            
-            if (localMap.count("kA21")) newRemoteVec.push_back({"kA21", localMap.at("kA21")});
-            if (localMap.count("kA9")) newRemoteVec.push_back({"kA9", localMap.at("kA9")});
-            if (localMap.count("93")) newRemoteVec.push_back({"93", localMap.at("93")});
-            
-            remoteData.saveString = buildSaveStringOrdered(newRemoteVec);
-        }
+        // v0.5.2: StartPos configuration is authoritative shared editor state.
+        // Older builds preserved several StartPos keys from the receiving client,
+        // which could silently overwrite the sender's configuration after sync.
+        // Keep this compatibility helper as a no-op so existing call sites remain
+        // valid while the complete remote saveString is applied unchanged.
+        (void)remoteData;
+        (void)localObj;
     }
 
     bool hasDeepPropertyChanges(GameObject* obj, std::string const& oldSave, std::string const& newSave) {
@@ -127,16 +116,6 @@ namespace mpedit::ActionSerializer {
         for (auto const& k : {"2", "3", "4", "5", "11", "32", "128", "129"}) {
             oldMap.erase(k);
             newMap.erase(k);
-        }
-
-        // Ignore Disable Start Pos changes (kA21, kA9, and 93) so they remain local
-        if (obj && obj->m_objectID == 31) {
-            oldMap.erase("kA21");
-            newMap.erase("kA21");
-            oldMap.erase("kA9");
-            newMap.erase("kA9");
-            oldMap.erase("93");
-            newMap.erase("93");
         }
 
         if (oldMap.size() != newMap.size()) return true;

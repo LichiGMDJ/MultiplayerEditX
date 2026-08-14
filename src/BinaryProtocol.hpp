@@ -35,6 +35,25 @@ namespace mpedit::proto {
         RoomInfo          = 0x32,
         HostMigration     = 0x33,
         Reconnect         = 0x34,
+        ProtocolHello     = 0x35,
+        ReliableEnvelope = 0x36,
+        ReliableAck      = 0x37,
+        LevelDigest      = 0x38,
+        LevelManifest    = 0x39,
+        LevelRepairRequest = 0x3A,
+        FullResyncRequest  = 0x3B,
+        InitialSyncRequest = 0x3C,
+        BulkPasteStart     = 0x3D,
+        BulkPasteChunk     = 0x3E,
+        BulkPasteEnd       = 0x3F,
+
+        // Global shared-state coordination (reliable channel)
+        GlobalRevision        = 0x42,
+        SharedDigest          = 0x43,
+        GlobalSnapshotRequest = 0x44,
+        KickPlayer            = 0x45,
+        MusicChanged          = 0x46,
+        RoomSettingsChanged   = 0x47,
 
         // Cursor (unreliable channel)
         CursorUpdate      = 0x40,
@@ -307,6 +326,46 @@ namespace mpedit::proto {
     std::vector<uint8_t> serializePlayerJoined(
         int playerId, std::string const& name, int colorIndex);
     std::vector<uint8_t> serializePlayerLeft(int playerId);
+    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion);
+
+    std::vector<uint8_t> serializeReliableEnvelope(
+        uint32_t sequence, std::vector<uint8_t> const& payload);
+    std::vector<uint8_t> serializeReliableAck(uint32_t sequence);
+
+    std::vector<uint8_t> serializeLevelDigest(uint32_t objectCount, std::string const& hash);
+
+    struct LevelManifestEntry {
+        std::string uuid;
+        std::string hash;
+    };
+    std::vector<uint8_t> serializeLevelManifest(
+        uint32_t scanId, uint32_t chunkIndex, uint32_t totalChunks,
+        std::vector<LevelManifestEntry> const& entries);
+    std::vector<uint8_t> serializeLevelRepairRequest(
+        uint32_t scanId,
+        std::vector<std::string> const& missing,
+        std::vector<std::string> const& changed);
+    std::vector<uint8_t> serializeFullResyncRequest();
+    std::vector<uint8_t> serializeInitialSyncRequest();
+
+    std::vector<uint8_t> serializeBulkPasteStart(
+        uint32_t pasteId, uint32_t totalChunks, uint32_t totalObjects,
+        bool withColor, bool noUndo, float anchorX, float anchorY);
+    std::vector<uint8_t> serializeBulkPasteChunk(
+        uint32_t pasteId, uint32_t chunkIndex, std::string const& data,
+        std::vector<std::string> const& uuids);
+    std::vector<uint8_t> serializeBulkPasteEnd(uint32_t pasteId);
+
+    std::vector<uint8_t> serializeGlobalRevision(uint32_t revision, int authorPlayerId);
+    std::vector<uint8_t> serializeSharedDigest(
+        uint32_t revision, uint32_t objectCount, std::string const& hash);
+    std::vector<uint8_t> serializeGlobalSnapshotRequest(uint32_t revision);
+    std::vector<uint8_t> serializeKickPlayer(int targetPlayerId, std::string const& reason);
+    std::vector<uint8_t> serializeMusicChanged(int songID, int audioTrack, std::string const& title);
+    std::vector<uint8_t> serializeRoomSettingsChanged(
+        uint32_t maxPlayers, bool allowBuild, bool allowDelete, bool allowWorkshop,
+        bool allowLevelSettings, bool autoRepair, bool locked);
+
     std::vector<uint8_t> serializeError(std::string const& message);
 
     struct RoomInfoPlayer {
@@ -401,6 +460,112 @@ namespace mpedit::proto {
         int playerId;
     };
     PlayerLeftMsg deserializePlayerLeft(Reader& r);
+
+    struct ProtocolHelloMsg {
+        uint32_t protocolVersion = 0;
+    };
+    ProtocolHelloMsg deserializeProtocolHello(Reader& r);
+
+    struct ReliableEnvelopeMsg {
+        uint32_t sequence = 0;
+        std::vector<uint8_t> payload;
+    };
+    ReliableEnvelopeMsg deserializeReliableEnvelope(Reader& r);
+
+    struct ReliableAckMsg {
+        uint32_t sequence = 0;
+    };
+    ReliableAckMsg deserializeReliableAck(Reader& r);
+
+    struct LevelDigestMsg {
+        uint32_t objectCount = 0;
+        std::string hash;
+    };
+    LevelDigestMsg deserializeLevelDigest(Reader& r);
+
+    struct LevelManifestMsg {
+        uint32_t scanId = 0;
+        uint32_t chunkIndex = 0;
+        uint32_t totalChunks = 0;
+        std::vector<LevelManifestEntry> entries;
+    };
+    LevelManifestMsg deserializeLevelManifest(Reader& r);
+
+    struct LevelRepairRequestMsg {
+        uint32_t scanId = 0;
+        std::vector<std::string> missing;
+        std::vector<std::string> changed;
+    };
+    LevelRepairRequestMsg deserializeLevelRepairRequest(Reader& r);
+
+    struct FullResyncRequestMsg {};
+    FullResyncRequestMsg deserializeFullResyncRequest(Reader& r);
+
+    struct BulkPasteStartMsg {
+        uint32_t pasteId = 0;
+        uint32_t totalChunks = 0;
+        uint32_t totalObjects = 0;
+        bool withColor = false;
+        bool noUndo = false;
+        float anchorX = 0.f;
+        float anchorY = 0.f;
+    };
+    BulkPasteStartMsg deserializeBulkPasteStart(Reader& r);
+
+    struct BulkPasteChunkMsg {
+        uint32_t pasteId = 0;
+        uint32_t chunkIndex = 0;
+        std::string data;
+        std::vector<std::string> uuids;
+    };
+    BulkPasteChunkMsg deserializeBulkPasteChunk(Reader& r);
+
+    struct BulkPasteEndMsg {
+        uint32_t pasteId = 0;
+    };
+    BulkPasteEndMsg deserializeBulkPasteEnd(Reader& r);
+
+    struct GlobalRevisionMsg {
+        uint32_t revision = 0;
+        int authorPlayerId = 0;
+    };
+    GlobalRevisionMsg deserializeGlobalRevision(Reader& r);
+
+    struct SharedDigestMsg {
+        uint32_t revision = 0;
+        uint32_t objectCount = 0;
+        std::string hash;
+    };
+    SharedDigestMsg deserializeSharedDigest(Reader& r);
+
+    struct GlobalSnapshotRequestMsg {
+        uint32_t revision = 0;
+    };
+    GlobalSnapshotRequestMsg deserializeGlobalSnapshotRequest(Reader& r);
+
+    struct KickPlayerMsg {
+        int targetPlayerId = -1;
+        std::string reason;
+    };
+    KickPlayerMsg deserializeKickPlayer(Reader& r);
+
+    struct MusicChangedMsg {
+        int songID = 0;
+        int audioTrack = 0;
+        std::string title;
+    };
+    MusicChangedMsg deserializeMusicChanged(Reader& r);
+
+    struct RoomSettingsChangedMsg {
+        uint32_t maxPlayers = 8;
+        bool allowBuild = true;
+        bool allowDelete = true;
+        bool allowWorkshop = true;
+        bool allowLevelSettings = true;
+        bool autoRepair = true;
+        bool locked = false;
+    };
+    RoomSettingsChangedMsg deserializeRoomSettingsChanged(Reader& r);
 
     struct ErrorMsg {
         std::string message;

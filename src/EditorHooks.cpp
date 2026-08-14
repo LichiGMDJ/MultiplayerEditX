@@ -25,18 +25,37 @@ using namespace mpedit;
 namespace {
     int s_selectedObjectID = 1;
     bool s_inTransformSync = false;
+    bool s_inBulkPasteSync = false;
     cocos2d::CCPoint s_lastTouchPos = {0.f, 0.f};
     bool s_isTouching = false;
     std::set<GameObject*> s_startPosObjects;
     std::unordered_map<GameObject*, std::string> s_startPosSaveStrings;
+
+    constexpr char kEditorLayerTag[] = "#EL#";
+
+    std::string encodeLayerTaggedUuid(std::string const& uuid, int layer1, int layer2) {
+        return uuid + kEditorLayerTag + std::to_string(layer1)
+            + kEditorLayerTag + std::to_string(layer2);
+    }
+
+    std::string objectLayerSyncState(GameObject* obj, LevelEditorLayer* editor) {
+        if (!obj || !editor) return {};
+        auto state = std::string(obj->getSaveString(editor));
+        state += "|mpedit-editor-layers:" + std::to_string(obj->m_editorLayer)
+            + ":" + std::to_string(obj->m_editorLayer2);
+        return state;
+    }
 }
 
 namespace mpedit {
     void updateStartPosCache(GameObject* obj) {
-        if (obj && obj->m_objectID == 31 && s_startPosObjects.count(obj)) {
-            if (auto* editor = LevelEditorLayer::get()) {
-                s_startPosSaveStrings[obj] = obj->getSaveString(editor);
-            }
+        if (!obj || obj->m_objectID != 31) return;
+        // A StartPos may be created by a remote placement, targeted repair or
+        // initial snapshot after LevelEditorLayer::init() seeded the cache.
+        // Always register it before storing its full serialized state.
+        s_startPosObjects.insert(obj);
+        if (auto* editor = LevelEditorLayer::get()) {
+            s_startPosSaveStrings[obj] = obj->getSaveString(editor);
         }
     }
 }
@@ -270,7 +289,7 @@ namespace {
                     uuid = "lvl_obj_" + std::to_string(index);
                     handler.registerObject(uuid, obj);
                 }
-                allUuids.push_back(uuid);
+                allUuids.push_back(encodeLayerTaggedUuid(uuid, obj->m_editorLayer, obj->m_editorLayer2));
                 fullObjectsString += std::string(obj->getSaveString(editor)) + ";";
                 index++;
             }
@@ -300,8 +319,10 @@ namespace {
             std::filesystem::remove(tempPath, ec);
         }
 
-        constexpr size_t MAX_CHUNK_BYTES = 30000;
-        constexpr size_t MAX_UUIDS_PER_CHUNK = 500;
+        // Leave headroom for opcode/index/vector/string framing so every
+        // SyncLevelChunk stays below P2PManager's 24 KiB safe message target.
+        constexpr size_t MAX_CHUNK_BYTES = 12000;
+        constexpr size_t MAX_UUIDS_PER_CHUNK = 250;
 
         struct ChunkData {
             std::string objectsString; // Compressed bytes chunk
@@ -414,6 +435,14 @@ namespace {
     }
 }
 
+namespace mpedit {
+    void sendFullLevelSyncTo(int targetPlayerId) {
+        if (auto* editor = LevelEditorLayer::get()) {
+            sendChunkedSync(editor, targetPlayerId);
+        }
+    }
+}
+
 class $modify(MPLevelEditorLayer, LevelEditorLayer) {
     struct Fields {
         float m_cursorSendTimer = 0.f;
@@ -421,6 +450,13 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         bool m_inUndoRedo = false;
         cocos2d::CCPoint m_lastSentLevelPos = {0.f, 0.f};
         bool m_wasPlaytesting = false;
+        int m_lastHostSongID = 0;
+        int m_lastHostAudioTrack = 0;
+        bool m_musicBaselineReady = false;
+        float m_externalCompatScanTimer = 0.f;
+        std::unordered_set<std::string> m_externalCompatLiveUuids;
+        float m_integrityCheckTimer = 0.f;
+        bool m_forceIntegrityCheck = false;
 
         ~Fields() {
             auto& session = SessionManager::get();
@@ -435,10 +471,55 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
     void levelSettingsUpdated() {
         LevelEditorLayer::levelSettingsUpdated();
 
+        auto& session = SessionManager::get();
+        if (session.isInSession() && this->m_level) {
+            int currentSong = this->m_level->m_songID;
+            int currentTrack = this->m_level->m_audioTrack;
+            if (!m_fields->m_musicBaselineReady) {
+                m_fields->m_lastHostSongID = currentSong;
+                m_fields->m_lastHostAudioTrack = currentTrack;
+                m_fields->m_musicBaselineReady = true;
+            } else if (session.getRole() == SessionManager::Role::Client &&
+                       (currentSong != m_fields->m_lastHostSongID || currentTrack != m_fields->m_lastHostAudioTrack)) {
+                // GD may start the newly selected song preview before this
+                // callback fires. Stop that unauthorized preview first, then
+                // restore the authoritative host metadata.
+                if (auto* audio = FMODAudioEngine::sharedEngine()) {
+                    audio->stopAllMusic(true);
+                }
+                this->m_level->m_songID = m_fields->m_lastHostSongID;
+                this->m_level->m_audioTrack = m_fields->m_lastHostAudioTrack;
+                Notification::create("Only the host can change music", NotificationIcon::Warning)->show();
+                log::info("EditorHooks: blocked guest music change and stopped unauthorized preview");
+                return;
+            } else if (session.getRole() == SessionManager::Role::Host &&
+                       (currentSong != m_fields->m_lastHostSongID || currentTrack != m_fields->m_lastHostAudioTrack)) {
+                m_fields->m_lastHostSongID = currentSong;
+                m_fields->m_lastHostAudioTrack = currentTrack;
+                std::string title;
+                if (currentSong > 0) {
+                    if (auto* song = LevelTools::getSongObject(currentSong)) {
+                        title = std::string(song->m_artistName.c_str()) + " - " + std::string(song->m_songName.c_str());
+                    }
+                    if (title.empty()) title = "Song ID " + std::to_string(currentSong);
+                } else {
+                    title = LevelTools::getAudioTitle(currentTrack);
+                    if (title.empty()) title = "Official song " + std::to_string(currentTrack);
+                }
+                auto music = proto::serializeMusicChanged(currentSong, currentTrack, title);
+                P2PManager::get().send(std::move(music), ChannelType::Reliable);
+                log::info("EditorHooks: host changed music to {} (songID={}, audioTrack={})", title, currentSong, currentTrack);
+            }
+        }
+
         auto& handler = RemoteActionHandler::get();
         if (handler.isProcessingRemote() || !handler.isInitialSyncCompleted()) return;
+        if (session.isInSession() && session.getRole() == SessionManager::Role::Client &&
+            !P2PManager::get().getRoomSettings().allowLevelSettings) {
+            Notification::create("Host disabled guest level settings", NotificationIcon::Warning)->show();
+            return;
+        }
 
-        auto& session = SessionManager::get();
         if (session.isInSession()) {
             ActionSerializer::LevelSettingsData settings;
             if (this->m_levelSettings) {
@@ -478,6 +559,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
 
         SessionManager::get().onSessionStarted([this]() {
             auto& session = SessionManager::get();
+            m_fields->m_forceIntegrityCheck = true;
             if (this->m_objects) {
                 auto& handler = RemoteActionHandler::get();
                 int index = 0;
@@ -517,6 +599,17 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
 
             handler.setInitialSyncCompleted(true);
 
+            m_fields->m_externalCompatLiveUuids.clear();
+            if (this->m_objects) {
+                for (auto* obj : CCArrayExt<GameObject*>(this->m_objects)) {
+                    if (!obj) continue;
+                    auto uuid = handler.getUUIDForObject(obj);
+                    if (!uuid.empty()) {
+                        m_fields->m_externalCompatLiveUuids.insert(uuid);
+                    }
+                }
+            }
+
             if (session.getRole() == SessionManager::Role::Host) {
                 for (auto const& player : session.getPlayers()) {
                     if (player.id != session.getLocalPlayerId()) {
@@ -527,13 +620,9 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
             }
         }
 
-        SessionManager::get().onPlayerJoined([this](PlayerInfo const& info) {
-            auto& session = SessionManager::get();
-            if (session.getRole() == SessionManager::Role::Host && info.id != session.getLocalPlayerId()) {
-                sendChunkedSync(this, info.id);
-                log::info("EditorHooks: Sent chunked sync_level to new player {}", info.id);
-            }
-        });
+        // Initial level transfer is request-driven after ProtocolHello.
+        // This avoids a first-join race between peer callbacks and bootstrap sync.
+
 
         if (handler.hasPendingSync()) {
             handler.setEditorForInit(this);
@@ -567,6 +656,13 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         
         auto& session = SessionManager::get();
         if (session.isInSession()) {
+            if (session.getRole() == SessionManager::Role::Client) {
+                // Prevent a guest-selected editor preview from leaking into the
+                // normal Geometry Dash level/menu screens after leaving MP.
+                if (auto* audio = FMODAudioEngine::sharedEngine()) {
+                    audio->stopAllMusic(true);
+                }
+            }
             session.leaveSession();
             log::info("EditorHooks: Left session automatically on editor exit");
         }
@@ -579,6 +675,12 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
 
     // Intercept object creation — UUID assignment and sync is handled by addToSection hook
     GameObject* createObject(int objectID, cocos2d::CCPoint position, bool noUndo) {
+        auto& session = SessionManager::get();
+        if (session.isInSession() && session.getRole() == SessionManager::Role::Client &&
+            !RemoteActionHandler::get().isProcessingRemote() && !P2PManager::get().getRoomSettings().allowBuild) {
+            Notification::create("Host disabled guest building", NotificationIcon::Warning)->show();
+            return nullptr;
+        }
         auto* obj = LevelEditorLayer::createObject(objectID, position, noUndo);
         // addToSection is called internally by LevelEditorLayer::createObject,
         // which handles UUID assignment and placement sync.
@@ -588,6 +690,12 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
 
     // Intercept object removal to sync deletion
     void removeObject(GameObject* obj, bool undo) {
+        auto& permissionSession = SessionManager::get();
+        if (obj && permissionSession.isInSession() && permissionSession.getRole() == SessionManager::Role::Client &&
+            !RemoteActionHandler::get().isProcessingRemote() && !P2PManager::get().getRoomSettings().allowDelete) {
+            Notification::create("Host disabled guest deletion", NotificationIcon::Warning)->show();
+            return;
+        }
         if (!obj) {
             LevelEditorLayer::removeObject(obj, undo);
             return;
@@ -735,7 +843,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
             if (this->m_objects && this->m_objects->containsObject(obj)) {
                 existedBefore.insert(obj);
                 positionsBefore[obj] = obj->getPosition();
-                saveStringsBefore[obj] = obj->getSaveString(this);
+                saveStringsBefore[obj] = objectLayerSyncState(obj, this);
             }
         }
 
@@ -775,7 +883,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
                     handler.registerObject(uuid, obj);
                 }
                 
-                std::string currentSave = obj->getSaveString(this);
+                std::string currentSave = objectLayerSyncState(obj, this);
                 if (saveStringsBefore[obj] != currentSave) {
                     updatedObjects.push_back(ActionSerializer::extractObjectData(obj, uuid));
                 } else {
@@ -840,6 +948,97 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
 
         // Flush any batched placements (copy/paste/duplicate) as a single message.
         handler.flushPendingPlacements();
+
+        // v0.5.2 safety: a full snapshot received while playtesting is kept
+        // pending. Applying it while PlayerObject is traversing collision objects
+        // can invalidate CCNodes and crash inside collidedWithObjectInternal.
+        if (
+            this->m_playbackMode == PlaybackMode::Not &&
+            handler.hasPendingSync() &&
+            handler.isInitialSyncCompleted() &&
+            !handler.isProcessingRemote()
+        ) {
+            log::info("EditorHooks: applying deferred SyncLevel after playtest ended");
+            handler.applyPendingSync();
+        }
+
+        // Periodic integrity verification. The host is authoritative; clients
+        // send a stable UUID/saveString digest and receive targeted repair only
+        // when the state differs. Reconnect forces an immediate digest.
+        m_fields->m_integrityCheckTimer += dt;
+        if (
+            session.getRole() == SessionManager::Role::Client &&
+            handler.isInitialSyncCompleted() &&
+            !handler.isProcessingRemote() &&
+            (m_fields->m_forceIntegrityCheck || m_fields->m_integrityCheckTimer >= 20.0f)
+        ) {
+            m_fields->m_integrityCheckTimer = 0.f;
+            m_fields->m_forceIntegrityCheck = false;
+            handler.sendLevelDigestTo(0);
+        }
+
+        // Compatibility fallback for third-party editor mods (Layout Generator,
+        // Object Workshop-style bulk tools, etc.) that may bypass create/remove hooks.
+        m_fields->m_externalCompatScanTimer += dt;
+        if (
+            m_fields->m_externalCompatScanTimer >= 0.25f &&
+            !isPlaytesting &&
+            handler.isInitialSyncCompleted() &&
+            !handler.isProcessingRemote()
+        ) {
+            m_fields->m_externalCompatScanTimer = 0.f;
+
+            std::unordered_set<std::string> currentUuids;
+            std::vector<ActionSerializer::ObjectData> externalPlacements;
+            std::vector<std::string> externalDeletes;
+
+            if (this->m_objects) {
+                currentUuids.reserve(this->m_objects->count());
+                for (auto* obj : CCArrayExt<GameObject*>(this->m_objects)) {
+                    if (!obj) continue;
+
+                    auto uuid = handler.getUUIDForObject(obj);
+                    if (uuid.empty()) {
+                        uuid = RemoteActionHandler::generateUUID();
+                        handler.registerObject(uuid, obj);
+                        externalPlacements.push_back(ActionSerializer::extractObjectData(obj, uuid));
+                    }
+
+                    currentUuids.insert(uuid);
+                }
+            }
+
+            for (auto const& uuid : m_fields->m_externalCompatLiveUuids) {
+                if (currentUuids.contains(uuid)) continue;
+
+                // If the mapping is already gone, our normal remove hook handled it.
+                // If it still exists, a third-party mod removed the object behind us.
+                if (handler.getObjectByUUID(uuid) != nullptr) {
+                    externalDeletes.push_back(uuid);
+                    handler.unregisterObject(uuid);
+                }
+            }
+
+            if (!externalPlacements.empty()) {
+                auto data = proto::serializePlaceObjects(externalPlacements);
+                P2PManager::get().send(std::move(data), ChannelType::Reliable);
+                log::info(
+                    "EditorHooks: compatibility scan synced {} externally-created objects",
+                    externalPlacements.size()
+                );
+            }
+
+            if (!externalDeletes.empty()) {
+                auto data = proto::serializeDeleteObjects(externalDeletes);
+                P2PManager::get().send(std::move(data), ChannelType::Reliable);
+                log::info(
+                    "EditorHooks: compatibility scan synced {} externally-deleted objects",
+                    externalDeletes.size()
+                );
+            }
+
+            m_fields->m_externalCompatLiveUuids = std::move(currentUuids);
+        }
 
         // Send cursor position periodically
         m_fields->m_cursorSendTimer += dt;
@@ -948,6 +1147,32 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
                     }
                 }
                 
+                int currentSongId = 0;
+                int currentAudioTrack = 0;
+                if (this->m_level) {
+                    currentSongId = this->m_level->m_songID;
+                    currentAudioTrack = this->m_level->m_audioTrack;
+                }
+                std::string currentMusicTitle;
+                if (currentSongId > 0) {
+                    if (auto* song = LevelTools::getSongObject(currentSongId)) {
+                        std::string songName = song->m_songName.c_str();
+                        std::string artistName = song->m_artistName.c_str();
+                        if (!songName.empty()) {
+                            currentMusicTitle = artistName.empty() ? songName : artistName + " - " + songName;
+                        }
+                    }
+                    if (currentMusicTitle.empty()) currentMusicTitle = "Song ID " + std::to_string(currentSongId);
+                } else {
+                    currentMusicTitle = LevelTools::getAudioTitle(currentAudioTrack);
+                    if (currentMusicTitle.empty()) currentMusicTitle = "Official song " + std::to_string(currentAudioTrack);
+                }
+                for (char& ch : currentMusicTitle) {
+                    if (ch == '\n' || ch == '\r') ch = ' ';
+                }
+                statusStr += ":music:" + std::to_string(currentSongId) + ":" +
+                    std::to_string(currentAudioTrack) + ":" + currentMusicTitle;
+
                 auto data = proto::serializeCursorUpdate(levelPos.x, levelPos.y, statusStr);
                 P2PManager::get().send(std::move(data), ChannelType::Unreliable);
             }
@@ -1038,7 +1263,7 @@ namespace {
             for (auto& state : selected) {
                 auto tIt = tracked.find(state.obj);
                 if (tIt != tracked.end()) {
-                    tIt->second = state.obj->getSaveString(editor);
+                    tIt->second = objectLayerSyncState(state.obj, editor);
                 }
             }
         }
@@ -1053,6 +1278,99 @@ class $modify(MPEditorUI, EditorUI) {
     void onCreateObject(int id) {
         EditorUI::onCreateObject(id);
         s_selectedObjectID = id;
+    }
+
+    cocos2d::CCArray* pasteObjects(gd::string str, bool withColor, bool noUndo) {
+        auto& handler = RemoteActionHandler::get();
+        auto& session = SessionManager::get();
+
+        if (session.isInSession() && session.getRole() == SessionManager::Role::Client &&
+            !handler.isProcessingRemote() && !P2PManager::get().getRoomSettings().allowWorkshop) {
+            Notification::create("Host disabled Object Workshop / bulk paste", NotificationIcon::Warning)->show();
+            return nullptr;
+        }
+
+        bool shouldBulkSync = session.isInSession()
+            && !handler.isProcessingRemote()
+            && handler.isInitialSyncCompleted();
+
+        if (!shouldBulkSync) {
+            return EditorUI::pasteObjects(str, withColor, noUndo);
+        }
+
+        s_inBulkPasteSync = true;
+        auto* pasted = EditorUI::pasteObjects(str, withColor, noUndo);
+        s_inBulkPasteSync = false;
+
+        if (!pasted || pasted->count() == 0) return pasted;
+
+        // Assign UUIDs in the exact order returned by the native paste operation.
+        // The receiver performs the same paste and binds these UUIDs by the same
+        // returned-array order, avoiding lossy per-object reconstruction.
+        std::vector<std::string> uuids;
+        uuids.reserve(pasted->count());
+        bool haveAnchor = false;
+        float pasteAnchorX = 0.f;
+        float pasteAnchorY = 0.f;
+        for (auto* obj : CCArrayExt<GameObject*>(pasted)) {
+            if (!obj) continue;
+            if (!haveAnchor) {
+                pasteAnchorX = obj->getPositionX();
+                pasteAnchorY = obj->getPositionY();
+                haveAnchor = true;
+            }
+            auto uuid = handler.getUUIDForObject(obj);
+            if (uuid.empty()) {
+                uuid = RemoteActionHandler::generateUUID();
+                handler.registerObject(uuid, obj);
+            }
+            uuids.push_back(encodeLayerTaggedUuid(uuid, obj->m_editorLayer, obj->m_editorLayer2));
+            MessageBatcher::get().removePending(uuid);
+        }
+
+        static uint32_t s_nextBulkPasteId = 1;
+        uint32_t pasteId = s_nextBulkPasteId++;
+        if (pasteId == 0) pasteId = s_nextBulkPasteId++;
+
+        std::string raw = std::string(str);
+        constexpr size_t kRawBytesPerChunk = 12000;
+        constexpr size_t kUuidsPerChunk = 200;
+        size_t dataChunks = std::max<size_t>(1, (raw.size() + kRawBytesPerChunk - 1) / kRawBytesPerChunk);
+        size_t uuidChunks = std::max<size_t>(1, (uuids.size() + kUuidsPerChunk - 1) / kUuidsPerChunk);
+        uint32_t totalChunks = static_cast<uint32_t>(std::max(dataChunks, uuidChunks));
+
+        auto start = proto::serializeBulkPasteStart(
+            pasteId, totalChunks, static_cast<uint32_t>(uuids.size()), withColor, noUndo,
+            pasteAnchorX, pasteAnchorY
+        );
+        P2PManager::get().send(std::move(start), ChannelType::Reliable);
+
+        for (uint32_t i = 0; i < totalChunks; ++i) {
+            size_t dataOffset = static_cast<size_t>(i) * kRawBytesPerChunk;
+            size_t uuidOffset = static_cast<size_t>(i) * kUuidsPerChunk;
+            std::string dataChunk;
+            std::vector<std::string> uuidChunk;
+
+            if (dataOffset < raw.size()) {
+                dataChunk = raw.substr(dataOffset, std::min(kRawBytesPerChunk, raw.size() - dataOffset));
+            }
+            if (uuidOffset < uuids.size()) {
+                size_t count = std::min(kUuidsPerChunk, uuids.size() - uuidOffset);
+                uuidChunk.insert(uuidChunk.end(), uuids.begin() + uuidOffset, uuids.begin() + uuidOffset + count);
+            }
+
+            auto chunk = proto::serializeBulkPasteChunk(pasteId, i, dataChunk, uuidChunk);
+            P2PManager::get().send(std::move(chunk), ChannelType::Reliable);
+        }
+
+        auto end = proto::serializeBulkPasteEnd(pasteId);
+        P2PManager::get().send(std::move(end), ChannelType::Reliable);
+
+        log::info(
+            "EditorHooks: RAW bulk paste #{} synced {} objects, {} bytes in {} chunks",
+            pasteId, uuids.size(), raw.size(), totalChunks
+        );
+        return pasted;
     }
 
     bool ccTouchBegan(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
@@ -1110,7 +1428,7 @@ class $modify(MPEditorUI, EditorUI) {
             auto& tracked = handler.getTrackedSelections();
             if (tracked.find(obj) == tracked.end()) {
                 if (auto* editor = LevelEditorLayer::get()) {
-                    tracked[obj] = obj->getSaveString(editor);
+                    tracked[obj] = objectLayerSyncState(obj, editor);
                 }
                 if (!handler.isProcessingRemote()) {
                     auto data = proto::serializeLockObjects({uuid}, true);
@@ -1147,7 +1465,7 @@ class $modify(MPEditorUI, EditorUI) {
                     auto tIt = tracked.find(obj);
                     if (tIt != tracked.end()) {
                         if (auto* editor = LevelEditorLayer::get()) {
-                            std::string currentSave = obj->getSaveString(editor);
+                            std::string currentSave = objectLayerSyncState(obj, editor);
                             if (tIt->second != currentSave) {
                                 auto objData = ActionSerializer::extractObjectData(obj, uuid);
                                 auto data = proto::serializeUpdateObjects({objData});
@@ -1205,7 +1523,7 @@ class $modify(MPEditorUI, EditorUI) {
                     
                     uuids.push_back(uuid);
                     
-                    std::string currentSave = obj->getSaveString(editor);
+                    std::string currentSave = objectLayerSyncState(obj, editor);
                     if (savedString != currentSave) {
                         updates.push_back(ActionSerializer::extractObjectData(obj, uuid));
                     }
@@ -1341,7 +1659,7 @@ class $modify(MPEditorUI, EditorUI) {
                 auto uuid = handler.getOrCreateUUID(obj);
                 if (tracked.find(obj) == tracked.end()) {
                     if (editor) {
-                        tracked[obj] = obj->getSaveString(editor);
+                        tracked[obj] = objectLayerSyncState(obj, editor);
                     }
                     uuids.push_back(uuid);
                 }
@@ -1404,7 +1722,7 @@ class $modify(MPEditorUI, EditorUI) {
                 toDeselect.push_back(obj);
             } else {
                 if (tracked.find(obj) == tracked.end()) {
-                    tracked[obj] = obj->getSaveString(editor);
+                    tracked[obj] = objectLayerSyncState(obj, editor);
                     toLockUuids.push_back(uuid);
                 }
             }
@@ -1489,7 +1807,7 @@ class $modify(MPEditorUI, EditorUI) {
                 rec.flipY = obj->isFlipY();
                 reconciles.push_back(rec);
 
-                std::string currentSave = obj->getSaveString(editor);
+                std::string currentSave = objectLayerSyncState(obj, editor);
                 if (ActionSerializer::hasDeepPropertyChanges(obj, it->second, currentSave)) {
                     updates.push_back(ActionSerializer::extractObjectData(obj, uuid));
                 }
@@ -1498,7 +1816,7 @@ class $modify(MPEditorUI, EditorUI) {
 
                 it = tracked.erase(it);
             } else {
-                std::string currentSave = obj->getSaveString(editor);
+                std::string currentSave = objectLayerSyncState(obj, editor);
                 if (ActionSerializer::hasDeepPropertyChanges(obj, it->second, currentSave)) {
                     updates.push_back(ActionSerializer::extractObjectData(obj, uuid));
                     it->second = currentSave;
@@ -1531,7 +1849,7 @@ class $modify(MPEditorUI, EditorUI) {
             }
             auto uuid = handler.getUUIDForObject(obj);
             if (!uuid.empty()) {
-                std::string currentSave = obj->getSaveString(editor);
+                std::string currentSave = objectLayerSyncState(obj, editor);
                 if (s_startPosSaveStrings.count(obj)) {
                     if (ActionSerializer::hasDeepPropertyChanges(obj, s_startPosSaveStrings[obj], currentSave)) {
                         updates.push_back(ActionSerializer::extractObjectData(obj, uuid));
@@ -1649,6 +1967,10 @@ class $modify(MPBaseGameLayer, GJBaseGameLayer) {
         auto& session = SessionManager::get();
 
         if (!session.isInSession() || handler.isProcessingRemote() || !obj) {
+            return;
+        }
+
+        if (s_inBulkPasteSync) {
             return;
         }
 
@@ -1791,3 +2113,4 @@ class $modify(MPColorSelectPopup, ColorSelectPopup) {
         }
     }
 };
+

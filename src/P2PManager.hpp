@@ -11,6 +11,9 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#include <unordered_set>
+#include <deque>
+#include <cstdint>
 
 namespace rtc {
     class PeerConnection;
@@ -63,6 +66,22 @@ namespace mpedit {
         std::string getRoomCode() const;
         int getLocalPlayerId() const;
         std::string getError() const;
+        bool isPeerReconnect(int playerId);
+        uint32_t getGlobalRevision() const { return m_globalRevision.load(); }
+        int getLastGlobalAuthor() const { return m_lastGlobalAuthor.load(); }
+        struct RoomSettings {
+            uint32_t maxPlayers = 8;
+            bool allowBuild = true;
+            bool allowDelete = true;
+            bool allowWorkshop = true;
+            bool allowLevelSettings = true;
+            bool autoRepair = true;
+            bool locked = false;
+        };
+
+        RoomSettings getRoomSettings() const;
+        void setRoomSettings(RoomSettings const& settings);
+        void kickPlayer(int playerId);
 
 
 
@@ -121,7 +140,24 @@ namespace mpedit {
             std::string playerName;
             int colorIndex = 0;
             bool ready = false; // both channels open
+            bool protocolVerified = false;
+            uint32_t protocolVersion = 0;
+            std::vector<std::vector<uint8_t>> preHandshakeMessages;
             std::vector<PendingMessage> pendingMessages;
+            std::vector<std::vector<uint8_t>> bulkReliableQueue;
+
+            struct PendingAck {
+                std::vector<uint8_t> envelope;
+                uint64_t lastSentMs = 0;
+                uint32_t attempts = 0;
+                bool queued = true;
+            };
+            uint32_t nextReliableSequence = 1;
+            std::unordered_map<uint32_t, PendingAck> pendingReliableAcks;
+            std::unordered_set<uint32_t> receivedReliableSequences;
+            std::deque<uint32_t> receivedReliableOrder;
+            bool reconnecting = false;
+            bool connectionAnnounced = false;
             std::vector<PendingCandidate> pendingCandidates;
         };
 
@@ -140,6 +176,9 @@ namespace mpedit {
         void onPeerDisconnected(int playerId, bool unexpected);
 
         void relayMessage(int fromPlayerId, const uint8_t* data, size_t len, ChannelType channel);
+        void flushBulkReliableQueues();
+        void scheduleClientReconnect();
+        void finalizePeerHandshake(int playerId);
         void checkPeerReady(int playerId);
 
 
@@ -155,6 +194,14 @@ namespace mpedit {
         std::unordered_map<int, PeerInfo> m_peers;
         std::mutex m_peersMutex;
         int m_nextPlayerId = 1; // host assigns IDs (host = 0)
+        std::unordered_map<std::string, uint64_t> m_recentDisconnectedNames;
+        std::atomic<bool> m_reconnectScheduled{false};
+        int m_reconnectAttempts = 0;
+        std::atomic<uint32_t> m_globalRevision{0};
+        std::atomic<int> m_lastGlobalAuthor{0};
+        std::unordered_set<std::string> m_kickedNames;
+        RoomSettings m_roomSettings;
+        mutable std::mutex m_roomSettingsMutex;
 
 
         struct QueuedMessage {

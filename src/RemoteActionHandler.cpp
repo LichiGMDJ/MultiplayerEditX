@@ -11,12 +11,49 @@
 #include <iomanip>
 #include <set>
 #include <cmath>
+#include <algorithm>
+#include <unordered_set>
 
 using namespace geode::prelude;
 
 namespace mpedit {
 
+    void sendFullLevelSyncTo(int targetPlayerId);
+
     namespace {
+        struct ProcessingRemoteGuard {
+            bool& flag;
+
+            explicit ProcessingRemoteGuard(bool& value) : flag(value) {
+                flag = true;
+            }
+
+            ProcessingRemoteGuard(ProcessingRemoteGuard const&) = delete;
+            ProcessingRemoteGuard& operator=(ProcessingRemoteGuard const&) = delete;
+
+            ~ProcessingRemoteGuard() {
+                flag = false;
+            }
+        };
+    }
+
+    namespace {
+        struct RawBulkPasteRx {
+            bool active = false;
+            uint32_t pasteId = 0;
+            uint32_t totalChunks = 0;
+            uint32_t totalObjects = 0;
+            bool withColor = false;
+            bool noUndo = false;
+            float anchorX = 0.f;
+            float anchorY = 0.f;
+            std::vector<std::string> dataChunks;
+            std::vector<std::vector<std::string>> uuidChunks;
+            std::vector<bool> received;
+        };
+        std::unordered_map<int, RawBulkPasteRx> s_rawBulkPasteRx;
+        uint32_t s_lastGlobalRecoveryRevision = 0;
+
         std::set<GameObject*> snapshotExistingObjects(LevelEditorLayer* editor) {
             std::set<GameObject*> existing;
             if (editor && editor->m_objects) {
@@ -45,6 +82,17 @@ namespace mpedit {
             return newObjects;
         }
 
+        std::string stableIntegrityHash(std::string const& value) {
+            uint64_t hash = 1469598103934665603ull;
+            for (unsigned char c : value) {
+                hash ^= static_cast<uint64_t>(c);
+                hash *= 1099511628211ull;
+            }
+            std::ostringstream out;
+            out << std::hex << std::setw(16) << std::setfill('0') << hash;
+            return out.str();
+        }
+
         void applyTransformSafe(GameObject* obj, float rotation, float scaleX, float scaleY, bool flipX, bool flipY) {
             if (!obj) return;
             obj->setRotation(rotation);
@@ -52,6 +100,57 @@ namespace mpedit {
             obj->setFlipY(flipY);
             obj->setScaleX(scaleX);
             obj->setScaleY(scaleY);
+        }
+
+        struct LayerTaggedUuid {
+            std::string uuid;
+            int layer1 = 0;
+            int layer2 = 0;
+            bool tagged = false;
+        };
+
+        LayerTaggedUuid decodeLayerTaggedUuid(std::string const& value) {
+            constexpr std::string_view tag = "#EL#";
+            LayerTaggedUuid out;
+            out.uuid = value;
+            auto second = value.rfind(tag);
+            if (second == std::string::npos) return out;
+            auto first = value.rfind(tag, second - 1);
+            if (first == std::string::npos) return out;
+            auto l1 = geode::utils::numFromString<int>(value.substr(first + tag.size(), second - first - tag.size()));
+            auto l2 = geode::utils::numFromString<int>(value.substr(second + tag.size()));
+            if (l1.isErr() || l2.isErr()) return out;
+            out.uuid = value.substr(0, first);
+            out.layer1 = l1.unwrap();
+            out.layer2 = l2.unwrap();
+            out.tagged = true;
+            return out;
+        }
+
+        void applyEditorLayers(GameObject* obj, int layer1, int layer2) {
+            if (!obj) return;
+            obj->m_editorLayer = layer1;
+            obj->m_editorLayer2 = layer2;
+        }
+
+        std::vector<std::string> splitSerializedObjects(std::string const& objectsString) {
+            std::vector<std::string> out;
+            size_t start = 0;
+            while (start < objectsString.size()) {
+                size_t end = objectsString.find(';', start);
+                if (end == std::string::npos) end = objectsString.size();
+                if (end > start) out.push_back(objectsString.substr(start, end - start));
+                if (end == objectsString.size()) break;
+                start = end + 1;
+            }
+            return out;
+        }
+
+        int serializedObjectId(std::string const& saveString) {
+            auto fields = ActionSerializer::parseSaveString(saveString);
+            auto it = fields.find("1");
+            if (it == fields.end()) return 0;
+            return geode::utils::numFromString<int>(it->second).unwrapOr(0);
         }
     }
 
@@ -155,10 +254,358 @@ namespace mpedit {
             handleRemoteUpdateSettings(playerId, msg.settings);
         });
 
+        net.on(proto::Opcode::SharedDigest, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeSharedDigest(reader);
+            if (reader.hasError()) return;
+            if (SessionManager::get().getRole() != SessionManager::Role::Host) return;
+
+            auto& p2p = P2PManager::get();
+            uint32_t revision = p2p.getGlobalRevision();
+            if (msg.revision != revision) {
+                log::debug(
+                    "RemoteActionHandler: ignoring stale shared digest player={} remoteRev={} globalRev={}",
+                    playerId, msg.revision, revision
+                );
+                return;
+            }
+
+            auto [localCount, localHash] = computeLevelDigest();
+            if (localCount == msg.objectCount && localHash == msg.hash) {
+                log::debug(
+                    "RemoteActionHandler: GLOBAL HASH match rev={} player={} objects={} hash={}",
+                    revision, playerId, localCount, localHash
+                );
+                return;
+            }
+
+            log::warn(
+                "RemoteActionHandler: GLOBAL HASH mismatch rev={} player={} host={}/{} remote={}/{} author={}",
+                revision, playerId, localCount, localHash, msg.objectCount, msg.hash,
+                p2p.getLastGlobalAuthor()
+            );
+
+            if (!p2p.getRoomSettings().autoRepair) {
+                log::warn("RemoteActionHandler: AUTO REPAIR disabled; leaving rev={} mismatch untouched", revision);
+                return;
+            }
+
+            if (revision != 0 && s_lastGlobalRecoveryRevision == revision) {
+                log::warn(
+                    "RemoteActionHandler: divergence persists after recovery for global revision {}; waiting for next edit",
+                    revision
+                );
+                return;
+            }
+            s_lastGlobalRecoveryRevision = revision;
+
+            int author = p2p.getLastGlobalAuthor();
+            if (author <= 0) {
+                // Host authored the latest shared edit. Broadcast the host snapshot
+                // to every guest so convergence is global, not peer-specific.
+                for (auto const& participant : SessionManager::get().getPlayers()) {
+                    if (participant.id == SessionManager::get().getLocalPlayerId()) continue;
+                    sendFullLevelSyncTo(participant.id);
+                }
+                log::warn(
+                    "RemoteActionHandler: GLOBAL RECOVERY rev={} source=host -> all participants",
+                    revision
+                );
+            } else {
+                // A guest authored the latest edit. Ask that author for a snapshot;
+                // its SyncLevel stream reaches host and is relayed to every other guest.
+                auto request = proto::serializeGlobalSnapshotRequest(revision);
+                P2PManager::get().sendTo(author, request, ChannelType::Reliable);
+                log::warn(
+                    "RemoteActionHandler: GLOBAL RECOVERY rev={} requested snapshot from last author {}",
+                    revision, author
+                );
+            }
+        });
+
+        net.on(proto::Opcode::LevelManifest, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeLevelManifest(reader);
+            if (reader.hasError() || msg.totalChunks == 0 || msg.chunkIndex >= msg.totalChunks) return;
+            if (SessionManager::get().getRole() != SessionManager::Role::Client || playerId != 0) return;
+
+            if (!m_repairManifest.active || m_repairManifest.scanId != msg.scanId) {
+                m_repairManifest = {};
+                m_repairManifest.active = true;
+                m_repairManifest.hostPlayerId = playerId;
+                m_repairManifest.scanId = msg.scanId;
+                m_repairManifest.totalChunks = msg.totalChunks;
+                m_repairManifest.received.assign(msg.totalChunks, false);
+            }
+            if (m_repairManifest.totalChunks != msg.totalChunks) return;
+            if (!m_repairManifest.received[msg.chunkIndex]) {
+                m_repairManifest.received[msg.chunkIndex] = true;
+                for (auto const& entry : msg.entries) {
+                    m_repairManifest.entries.push_back({entry.uuid, entry.hash});
+                }
+            }
+
+            bool complete = std::all_of(
+                m_repairManifest.received.begin(),
+                m_repairManifest.received.end(),
+                [](bool v) { return v; }
+            );
+            if (!complete) return;
+
+            auto localEntries = buildLevelManifest();
+            std::unordered_map<std::string, std::string> localMap;
+            std::unordered_map<std::string, std::string> hostMap;
+            for (auto const& entry : localEntries) localMap[entry.uuid] = entry.hash;
+            for (auto const& entry : m_repairManifest.entries) hostMap[entry.uuid] = entry.hash;
+
+            std::vector<std::string> missing;
+            std::vector<std::string> changed;
+            std::vector<std::string> extra;
+
+            for (auto const& [uuid, hostHash] : hostMap) {
+                auto it = localMap.find(uuid);
+                if (it == localMap.end()) missing.push_back(uuid);
+                else if (it->second != hostHash) changed.push_back(uuid);
+            }
+            for (auto const& [uuid, _] : localMap) {
+                if (!hostMap.contains(uuid)) extra.push_back(uuid);
+            }
+
+            size_t diffCount = missing.size() + changed.size() + extra.size();
+            size_t relativeLimit = std::max<size_t>(64, hostMap.size() / 5);
+            if (diffCount > 256 || diffCount > relativeLimit) {
+                // v0.5.2: do NOT turn an integrity mismatch into an automatic
+                // destructive full-level replacement. Large snapshots were able
+                // to reset object-specific state and invalidate collision nodes.
+                // Keep using the manifest/targeted repair path below.
+                log::warn(
+                    "RemoteActionHandler: integrity diff is large ({} objects); using targeted repair instead of automatic SyncLevel",
+                    diffCount
+                );
+            }
+
+            if (!extra.empty()) {
+                handleRemoteDeleteObjects(playerId, extra);
+            }
+
+            constexpr size_t kRepairRequestBatch = 80;
+            size_t missingOffset = 0;
+            size_t changedOffset = 0;
+            while (missingOffset < missing.size() || changedOffset < changed.size()) {
+                std::vector<std::string> missingBatch;
+                std::vector<std::string> changedBatch;
+                for (size_t i = 0; i < kRepairRequestBatch && missingOffset < missing.size(); ++i) {
+                    missingBatch.push_back(missing[missingOffset++]);
+                }
+                for (size_t i = 0; i < kRepairRequestBatch && changedOffset < changed.size(); ++i) {
+                    changedBatch.push_back(changed[changedOffset++]);
+                }
+                auto request = proto::serializeLevelRepairRequest(
+                    msg.scanId, missingBatch, changedBatch
+                );
+                P2PManager::get().sendTo(0, request, ChannelType::Reliable);
+            }
+
+            log::info(
+                "RemoteActionHandler: targeted repair requested missing={} changed={} deleted-extra={}",
+                missing.size(), changed.size(), extra.size()
+            );
+            m_repairManifest = {};
+        });
+
+        net.on(proto::Opcode::LevelRepairRequest, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeLevelRepairRequest(reader);
+            if (reader.hasError()) return;
+            if (SessionManager::get().getRole() != SessionManager::Role::Host) return;
+
+            auto missingData = getObjectDataForUuids(msg.missing);
+            if (!missingData.empty()) {
+                auto packet = proto::serializePlaceObjects(missingData);
+                P2PManager::get().sendTo(playerId, packet, ChannelType::Reliable);
+            }
+
+            if (!msg.changed.empty()) {
+                auto deletePacket = proto::serializeDeleteObjects(msg.changed);
+                P2PManager::get().sendTo(playerId, deletePacket, ChannelType::Reliable);
+                auto changedData = getObjectDataForUuids(msg.changed);
+                if (!changedData.empty()) {
+                    auto placePacket = proto::serializePlaceObjects(changedData);
+                    P2PManager::get().sendTo(playerId, placePacket, ChannelType::Reliable);
+                }
+            }
+
+            log::info(
+                "RemoteActionHandler: repair response to player {} missing={} changed={}",
+                playerId, msg.missing.size(), msg.changed.size()
+            );
+        });
+
+        net.on(proto::Opcode::FullResyncRequest, [this](int playerId, proto::Reader& reader) {
+            (void)proto::deserializeFullResyncRequest(reader);
+            if (reader.hasError()) return;
+            if (SessionManager::get().getRole() != SessionManager::Role::Host) return;
+            log::warn("RemoteActionHandler: full SyncLevel requested by player {}", playerId);
+            sendFullLevelSyncTo(playerId);
+        });
+
+        net.on(proto::Opcode::InitialSyncRequest, [this](int playerId, proto::Reader&) {
+            if (SessionManager::get().getRole() != SessionManager::Role::Host) return;
+            log::info("RemoteActionHandler: InitialSyncRequest from player {}", playerId);
+            sendFullLevelSyncTo(playerId);
+        });
+
+        net.on(proto::Opcode::BulkPasteStart, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeBulkPasteStart(reader);
+            if (reader.hasError() || msg.totalChunks == 0 || msg.totalChunks > 4096) return;
+
+            auto& state = s_rawBulkPasteRx[playerId];
+            state = {};
+            state.active = true;
+            state.pasteId = msg.pasteId;
+            state.totalChunks = msg.totalChunks;
+            state.totalObjects = msg.totalObjects;
+            state.withColor = msg.withColor;
+            state.noUndo = msg.noUndo;
+            state.anchorX = msg.anchorX;
+            state.anchorY = msg.anchorY;
+            state.dataChunks.resize(msg.totalChunks);
+            state.uuidChunks.resize(msg.totalChunks);
+            state.received.assign(msg.totalChunks, false);
+            log::info("RemoteActionHandler: RAW BulkPasteStart #{} chunks={} objects={}",
+                msg.pasteId, msg.totalChunks, msg.totalObjects);
+        });
+
+        net.on(proto::Opcode::BulkPasteChunk, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeBulkPasteChunk(reader);
+            if (reader.hasError()) return;
+            auto it = s_rawBulkPasteRx.find(playerId);
+            if (it == s_rawBulkPasteRx.end()) return;
+            auto& state = it->second;
+            if (!state.active || state.pasteId != msg.pasteId || msg.chunkIndex >= state.totalChunks) return;
+            state.dataChunks[msg.chunkIndex] = std::move(msg.data);
+            state.uuidChunks[msg.chunkIndex] = std::move(msg.uuids);
+            state.received[msg.chunkIndex] = true;
+        });
+
+        net.on(proto::Opcode::BulkPasteEnd, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeBulkPasteEnd(reader);
+            if (reader.hasError()) return;
+            auto it = s_rawBulkPasteRx.find(playerId);
+            if (it == s_rawBulkPasteRx.end()) return;
+            auto state = std::move(it->second);
+            s_rawBulkPasteRx.erase(it);
+            if (!state.active || state.pasteId != msg.pasteId) return;
+            if (!std::all_of(state.received.begin(), state.received.end(), [](bool v) { return v; })) {
+                log::warn("RemoteActionHandler: RAW bulk paste #{} ended with missing chunks", msg.pasteId);
+                return;
+            }
+
+            std::string raw;
+            std::vector<std::string> uuids;
+            for (uint32_t i = 0; i < state.totalChunks; ++i) {
+                raw += state.dataChunks[i];
+                uuids.insert(uuids.end(), state.uuidChunks[i].begin(), state.uuidChunks[i].end());
+            }
+
+            auto* editor = getEditorLayer();
+            if (!editor || !editor->m_editorUI) {
+                log::warn("RemoteActionHandler: RAW bulk paste #{} dropped because editor is unavailable", msg.pasteId);
+                return;
+            }
+
+            m_processingRemote = true;
+            auto* pasted = editor->m_editorUI->pasteObjects(gd::string(raw), state.withColor, state.noUndo);
+            m_processingRemote = false;
+
+            if (!pasted) {
+                log::warn("RemoteActionHandler: RAW bulk paste #{} returned null", msg.pasteId);
+                return;
+            }
+
+            GameObject* localAnchor = nullptr;
+            for (auto* obj : CCArrayExt<GameObject*>(pasted)) {
+                if (obj) { localAnchor = obj; break; }
+            }
+            float dx = localAnchor ? state.anchorX - localAnchor->getPositionX() : 0.f;
+            float dy = localAnchor ? state.anchorY - localAnchor->getPositionY() : 0.f;
+            if (localAnchor && (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f)) {
+                for (auto* obj : CCArrayExt<GameObject*>(pasted)) {
+                    if (!obj) continue;
+                    obj->setPosition({obj->getPositionX() + dx, obj->getPositionY() + dy});
+                }
+                log::info("RemoteActionHandler: RAW bulk paste #{} anchor corrected by ({}, {})", msg.pasteId, dx, dy);
+            }
+
+            size_t index = 0;
+            for (auto* obj : CCArrayExt<GameObject*>(pasted)) {
+                if (!obj) continue;
+                if (index < uuids.size()) {
+                    auto tagged = decodeLayerTaggedUuid(uuids[index]);
+                    if (tagged.tagged) applyEditorLayers(obj, tagged.layer1, tagged.layer2);
+                    registerObject(tagged.uuid, obj);
+                } else {
+                    registerObject(RemoteActionHandler::generateUUID(), obj);
+                }
+                ++index;
+            }
+
+            if (index != uuids.size() || index != state.totalObjects) {
+                log::warn(
+                    "RemoteActionHandler: RAW bulk paste #{} object count differs: pasted={} uuids={} sender={}",
+                    msg.pasteId, index, uuids.size(), state.totalObjects
+                );
+            } else {
+                log::info("RemoteActionHandler: RAW bulk paste #{} reproduced {} objects exactly",
+                    msg.pasteId, index);
+            }
+        });
+
+        net.on(proto::Opcode::GlobalSnapshotRequest, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeGlobalSnapshotRequest(reader);
+            if (reader.hasError()) return;
+            if (SessionManager::get().getRole() != SessionManager::Role::Client || playerId != 0) return;
+            if (msg.revision != P2PManager::get().getGlobalRevision()) {
+                log::debug(
+                    "RemoteActionHandler: ignored stale GlobalSnapshotRequest rev={} localRev={}",
+                    msg.revision, P2PManager::get().getGlobalRevision()
+                );
+                return;
+            }
+            sendFullLevelSyncTo(0);
+            log::warn(
+                "RemoteActionHandler: sent GLOBAL SNAPSHOT rev={} to host for room-wide convergence",
+                msg.revision
+            );
+        });
+
+        net.on(proto::Opcode::MusicChanged, [this](int playerId, proto::Reader& reader) {
+            auto msg = proto::deserializeMusicChanged(reader);
+            if (reader.hasError() || playerId != 0) return;
+            auto* editor = getEditorLayer();
+            if (!editor || !editor->m_level) return;
+            ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
+            editor->m_level->m_songID = msg.songID;
+            editor->m_level->m_audioTrack = msg.audioTrack;
+            editor->levelSettingsUpdated();
+            Notification::create("Host changed music: " + msg.title, NotificationIcon::Info)->show();
+            log::info("RemoteActionHandler: host music applied: {}", msg.title);
+        });
+
         net.on(proto::Opcode::SyncLevelStart, [this](int playerId, proto::Reader& reader) {
             auto msg = proto::deserializeSyncLevelStart(reader);
             if (reader.hasError()) {
                 log::error("RemoteActionHandler: Error deserializing SyncLevelStart");
+                return;
+            }
+            constexpr uint32_t kMaxSyncChunks = 4096;
+            constexpr uint32_t kMaxSyncObjects = 500000;
+            if (msg.totalChunks == 0 || msg.totalChunks > kMaxSyncChunks || msg.totalObjects > kMaxSyncObjects) {
+                log::error(
+                    "RemoteActionHandler: rejected SyncLevelStart with unsafe bounds (chunks={}, objects={})",
+                    msg.totalChunks,
+                    msg.totalObjects
+                );
+                m_chunkedSync.active = false;
+                m_chunkedSync.chunks.clear();
+                m_chunkedSync.uuidChunks.clear();
                 return;
             }
             m_chunkedSync.hostPlayerId = playerId;
@@ -197,8 +644,26 @@ namespace mpedit {
             }
             if (!m_chunkedSync.active || playerId != m_chunkedSync.hostPlayerId) return;
 
-            // Reconstruct objectsString
-            std::string compressedString = "";
+            // Reconstruct objectsString with a hard compressed-size ceiling.
+            constexpr size_t kMaxCompressedSyncBytes = 64 * 1024 * 1024;
+            size_t compressedSize = 0;
+            for (auto const& chunk : m_chunkedSync.chunks) {
+                if (chunk.size() > kMaxCompressedSyncBytes - std::min(compressedSize, kMaxCompressedSyncBytes)) {
+                    compressedSize = kMaxCompressedSyncBytes + 1;
+                    break;
+                }
+                compressedSize += chunk.size();
+            }
+            if (compressedSize > kMaxCompressedSyncBytes) {
+                log::error("RemoteActionHandler: rejected oversized SyncLevel payload");
+                m_chunkedSync.active = false;
+                m_chunkedSync.chunks.clear();
+                m_chunkedSync.uuidChunks.clear();
+                return;
+            }
+
+            std::string compressedString;
+            compressedString.reserve(compressedSize);
             for (auto const& chunk : m_chunkedSync.chunks) {
                 compressedString += chunk;
             }
@@ -224,13 +689,128 @@ namespace mpedit {
                 uuids.insert(uuids.end(), uuidChunk.begin(), uuidChunk.end());
             }
 
-            log::info("RemoteActionHandler: SyncLevelEnd received, processing full sync");
-            handleRemoteSyncLevel(playerId, objectsString, uuids, m_chunkedSync.settings, msg.locks);
+            auto* editor = getEditorLayer();
+            if (editor && editor->m_playbackMode != PlaybackMode::Not) {
+                // Never destroy/recreate editor objects while gameplay collision
+                // code is walking them. Keep the newest authoritative snapshot
+                // and apply it once playback returns to Not.
+                m_pendingSync = PendingSync{
+                    playerId,
+                    objectsString,
+                    uuids,
+                    m_chunkedSync.settings,
+                    msg.locks
+                };
+                log::warn("RemoteActionHandler: SyncLevel deferred until playtest ends");
+            } else {
+                log::info("RemoteActionHandler: SyncLevelEnd received, processing full sync");
+                handleRemoteSyncLevel(playerId, objectsString, uuids, m_chunkedSync.settings, msg.locks);
+            }
 
             m_chunkedSync.active = false;
             m_chunkedSync.chunks.clear();
             m_chunkedSync.uuidChunks.clear();
         });
+    }
+
+    std::vector<RemoteActionHandler::IntegrityEntry> RemoteActionHandler::buildLevelManifest() const {
+        std::vector<IntegrityEntry> entries;
+        auto* editor = getEditorLayer();
+        if (!editor || !editor->m_objects) return entries;
+
+        entries.reserve(editor->m_objects->count());
+        for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+            if (!obj) continue;
+            auto uuid = getUUIDForObject(obj);
+            if (uuid.empty()) continue;
+            std::string save = obj->getSaveString(editor);
+            if (obj->m_objectID == 31) {
+                auto ordered = ActionSerializer::parseSaveStringOrdered(save);
+                std::vector<std::pair<std::string, std::string>> normalized;
+                normalized.reserve(ordered.size());
+                for (auto const& pair : ordered) {
+                    if (pair.first == "kA21" || pair.first == "kA9" || pair.first == "93") continue;
+                    normalized.push_back(pair);
+                }
+                save = ActionSerializer::buildSaveStringOrdered(normalized);
+            }
+            save += "|mpedit-editor-layers:" + std::to_string(obj->m_editorLayer)
+                + ":" + std::to_string(obj->m_editorLayer2);
+            entries.push_back({uuid, stableIntegrityHash(save)});
+        }
+        std::sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
+            return a.uuid < b.uuid;
+        });
+        return entries;
+    }
+
+    std::pair<uint32_t, std::string> RemoteActionHandler::computeLevelDigest() const {
+        auto entries = buildLevelManifest();
+        std::string material;
+        material.reserve(entries.size() * 48);
+        for (auto const& entry : entries) {
+            material += entry.uuid;
+            material.push_back('=');
+            material += entry.hash;
+            material.push_back(';');
+        }
+        return {static_cast<uint32_t>(entries.size()), stableIntegrityHash(material)};
+    }
+
+    std::vector<ActionSerializer::ObjectData> RemoteActionHandler::getObjectDataForUuids(
+        std::vector<std::string> const& uuids) const
+    {
+        std::vector<ActionSerializer::ObjectData> result;
+        auto* editor = getEditorLayer();
+        if (!editor || !editor->m_objects || uuids.empty()) return result;
+
+        std::unordered_set<std::string> wanted(uuids.begin(), uuids.end());
+        result.reserve(wanted.size());
+        for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+            if (!obj) continue;
+            auto uuid = getUUIDForObject(obj);
+            if (uuid.empty() || !wanted.contains(uuid)) continue;
+            result.push_back(ActionSerializer::extractObjectData(obj, uuid));
+        }
+        return result;
+    }
+
+    void RemoteActionHandler::sendLevelDigestTo(int playerId) {
+        auto [count, hash] = computeLevelDigest();
+        uint32_t revision = P2PManager::get().getGlobalRevision();
+        auto packet = proto::serializeSharedDigest(revision, count, hash);
+        P2PManager::get().sendTo(playerId, packet, ChannelType::Reliable);
+        log::debug(
+            "RemoteActionHandler: sent GLOBAL HASH rev={} player={} objects={} hash={}",
+            revision, playerId, count, hash
+        );
+    }
+
+    void RemoteActionHandler::sendLevelManifestTo(int playerId) {
+        auto entries = buildLevelManifest();
+        static uint32_t s_scanId = 1;
+        uint32_t scanId = s_scanId++;
+        constexpr size_t kEntriesPerChunk = 100;
+        uint32_t totalChunks = static_cast<uint32_t>(
+            std::max<size_t>(1, (entries.size() + kEntriesPerChunk - 1) / kEntriesPerChunk)
+        );
+
+        for (uint32_t chunk = 0; chunk < totalChunks; ++chunk) {
+            size_t begin = static_cast<size_t>(chunk) * kEntriesPerChunk;
+            size_t end = std::min(entries.size(), begin + kEntriesPerChunk);
+            std::vector<proto::LevelManifestEntry> wireEntries;
+            wireEntries.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                wireEntries.push_back({entries[i].uuid, entries[i].hash});
+            }
+            auto packet = proto::serializeLevelManifest(scanId, chunk, totalChunks, wireEntries);
+            P2PManager::get().sendTo(playerId, packet, ChannelType::Reliable);
+        }
+
+        log::info(
+            "RemoteActionHandler: sent integrity manifest scan={} player={} objects={} chunks={}",
+            scanId, playerId, entries.size(), totalChunks
+        );
     }
 
     void RemoteActionHandler::clearHandlers() {
@@ -243,6 +823,7 @@ namespace mpedit {
         m_chunkedSync.active = false;
         m_chunkedSync.chunks.clear();
         m_chunkedSync.uuidChunks.clear();
+        m_repairManifest = {};
         P2PManager::get().clearHandlers();
     }
 
@@ -329,7 +910,7 @@ namespace mpedit {
             return;
         }
 
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         std::unordered_set<std::string> processedUUIDs;
 
@@ -366,6 +947,7 @@ namespace mpedit {
                     }
 
                     applyTransformSafe(obj, objData.rotation, objData.scaleX, objData.scaleY, objData.flipX, objData.flipY);
+                    applyEditorLayers(obj, objData.editorLayer, objData.editorLayer2);
                     registerObject(objData.uuid, obj);
                     
                     if (obj->m_objectID == 31) {
@@ -383,7 +965,9 @@ namespace mpedit {
                                     orange->setPositionOverride({orangeData.x, orangeData.y});
                                     applyTransformSafe(orange, orangeData.rotation, orangeData.scaleX,
                                                        orangeData.scaleY, orangeData.flipX, orangeData.flipY);
-                                    registerObject(orangeData.uuid, orange);
+                                    applyEditorLayers(orange, orangeData.editorLayer, orangeData.editorLayer2);
+                                    applyEditorLayers(orange, orangeData.editorLayer, orangeData.editorLayer2);
+                                registerObject(orangeData.uuid, orange);
                                     processedUUIDs.insert(orangeData.uuid);
                                     break;
                                 }
@@ -444,7 +1028,7 @@ namespace mpedit {
             return;
         }
 
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         for (auto& uuid : uuids) {
             auto* obj = getObjectByUUID(uuid);
@@ -507,7 +1091,7 @@ namespace mpedit {
             return;
         }
 
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         for (auto& move : moves) {
             auto* obj = getObjectByUUID(move.uuid);
@@ -549,7 +1133,7 @@ namespace mpedit {
         }
 
         log::debug("RemoteActionHandler: applying remote transform (playerId={}, n={})", playerId, transforms.size());
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         for (auto& t : transforms) {
             auto* obj = getObjectByUUID(t.uuid);
@@ -584,7 +1168,7 @@ namespace mpedit {
         }
 
         log::debug("RemoteActionHandler: applying remote reconcile (playerId={}, n={})", playerId, reconciles.size());
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         for (auto& r : reconciles) {
             auto* obj = getObjectByUUID(r.uuid);
@@ -626,7 +1210,7 @@ namespace mpedit {
             return;
         }
 
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
         std::unordered_set<std::string> processedUUIDs;
 
         for (size_t i = 0; i < objects.size(); i++) {
@@ -641,6 +1225,7 @@ namespace mpedit {
                 if (tpPortal->m_isYellowPortal) {
                     tpPortal->setPositionOverride({objData.x, objData.y});
                     applyTransformSafe(oldObj, objData.rotation, objData.scaleX, objData.scaleY, objData.flipX, objData.flipY);
+                    applyEditorLayers(oldObj, objData.editorLayer, objData.editorLayer2);
                     log::debug("RemoteActionHandler: Updated orange portal directly without recreation");
                     continue;
                 }
@@ -711,6 +1296,7 @@ namespace mpedit {
                 }
 
                 applyTransformSafe(newObj, objData.rotation, objData.scaleX, objData.scaleY, objData.flipX, objData.flipY);
+                applyEditorLayers(newObj, objData.editorLayer, objData.editorLayer2);
                 registerObject(objData.uuid, newObj);
                 
                 if (newObj->m_objectID == 31) {
@@ -729,6 +1315,7 @@ namespace mpedit {
                                 orange->setPositionOverride({orangeData.x, orangeData.y});
                                 applyTransformSafe(orange, orangeData.rotation, orangeData.scaleX,
                                                    orangeData.scaleY, orangeData.flipX, orangeData.flipY);
+                                applyEditorLayers(orange, orangeData.editorLayer, orangeData.editorLayer2);
                                 registerObject(orangeData.uuid, orange);
                                 processedUUIDs.insert(orangeData.uuid);
                                 foundInData = true;
@@ -769,7 +1356,9 @@ namespace mpedit {
                                     orange->setPositionOverride({orangeData.x, orangeData.y});
                                     applyTransformSafe(orange, orangeData.rotation, orangeData.scaleX,
                                                        orangeData.scaleY, orangeData.flipX, orangeData.flipY);
-                                    registerObject(orangeData.uuid, orange);
+                                    applyEditorLayers(orange, orangeData.editorLayer, orangeData.editorLayer2);
+                                    applyEditorLayers(orange, orangeData.editorLayer, orangeData.editorLayer2);
+                                registerObject(orangeData.uuid, orange);
                                     processedUUIDs.insert(orangeData.uuid);
                                     foundInData = true;
                                     break;
@@ -804,7 +1393,7 @@ namespace mpedit {
         std::vector<std::string> const& uuids, 
         bool locked
     ) {
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         if (locked) {
             auto* editor = getEditorLayer();
@@ -901,8 +1490,18 @@ namespace mpedit {
         log::info("RemoteActionHandler: Editor ready (m_objects count before sync = {})",
             editor->m_objects ? editor->m_objects->count() : 0);
 
+        auto serializedObjects = splitSerializedObjects(objectsString);
+        if (serializedObjects.size() != uuids.size()) {
+            log::error(
+                "RemoteActionHandler: refusing destructive SyncLevel because serialized object count ({}) != UUID count ({})",
+                serializedObjects.size(),
+                uuids.size()
+            );
+            return;
+        }
+
         m_pendingSync.reset();
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         if (auto* editorUI = editor->m_editorUI) {
             editorUI->deselectAll();
@@ -942,23 +1541,63 @@ namespace mpedit {
             auto newObjs = createObjectsFromSaveStringRobust(editor, objectsString);
             log::info("RemoteActionHandler: Spawned {} objects from objectsString (len={})",
                 newObjs.size(), objectsString.size());
-            int index = 0;
-            for (auto* obj : newObjs) {
-                if (index < static_cast<int>(uuids.size())) {
-                    registerObject(uuids[index], obj);
-                    index++;
-                } else {
-                    registerObject("lvl_obj_" + std::to_string(index), obj);
-                    index++;
+            // Match each authoritative serialized record to a newly-created object
+            // with the same object ID. GD may auto-create companion objects (for
+            // example teleport portal parts), so blindly zipping newObjs with UUIDs
+            // can shift every later UUID and make future deletes hit the wrong object.
+            std::unordered_set<GameObject*> assigned;
+            size_t mapped = 0;
+            for (size_t i = 0; i < serializedObjects.size(); ++i) {
+                int expectedId = serializedObjectId(serializedObjects[i]);
+                GameObject* match = nullptr;
+                for (auto* candidate : newObjs) {
+                    if (!candidate || assigned.contains(candidate)) continue;
+                    if (candidate->m_objectID == expectedId) {
+                        match = candidate;
+                        break;
+                    }
                 }
-                
-                if (obj->m_objectID == 31) {
-                    updateStartPosCache(obj);
+                if (!match) {
+                    log::error(
+                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={})",
+                        i,
+                        expectedId
+                    );
+                    continue;
+                }
+
+                assigned.insert(match);
+                auto tagged = decodeLayerTaggedUuid(uuids[i]);
+                if (tagged.tagged) applyEditorLayers(match, tagged.layer1, tagged.layer2);
+                registerObject(tagged.uuid, match);
+                ++mapped;
+
+                if (match->m_objectID == 31) {
+                    if (auto* startPos = typeinfo_cast<StartPosObject*>(match)) {
+                        // createObjectsFromString normally restores this already,
+                        // but StartPos has additional runtime settings/cache state.
+                        startPos->loadSettingsFromString(serializedObjects[i]);
+                    }
+                    updateStartPosCache(match);
                 }
             }
-            if (index != static_cast<int>(uuids.size())) {
-                log::warn("RemoteActionHandler: object/uuid count mismatch on sync "
-                          "(spawned={}, uuids={})", index, uuids.size());
+
+            size_t fallbackIndex = uuids.size();
+            for (auto* obj : newObjs) {
+                if (!obj || assigned.contains(obj)) continue;
+                if (getUUIDForObject(obj).empty()) {
+                    registerObject("sync_extra_" + std::to_string(fallbackIndex++), obj);
+                }
+                if (obj->m_objectID == 31) updateStartPosCache(obj);
+            }
+
+            if (mapped != uuids.size()) {
+                log::error(
+                    "RemoteActionHandler: snapshot mapping incomplete (mapped={}, uuids={}, spawned={})",
+                    mapped,
+                    uuids.size(),
+                    newObjs.size()
+                );
             }
         } else if (!uuids.empty()) {
             log::warn("RemoteActionHandler: sync_level had {} uuids but empty objectsString — "
@@ -1311,7 +1950,7 @@ namespace mpedit {
         auto* editor = getEditorLayer();
         if (!editor) return;
 
-        m_processingRemote = true;
+        ProcessingRemoteGuard processingRemoteGuard(m_processingRemote);
 
         log::info("RemoteActionHandler: Updating level settings from player {}", playerId);
 
@@ -1323,3 +1962,5 @@ namespace mpedit {
     }
 
 } // namespace mpedit
+
+

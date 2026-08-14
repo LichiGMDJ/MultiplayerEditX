@@ -7,6 +7,7 @@
 
 #include <optional>
 #include <vector>
+#include <utility>
 
 class GameObject;
 class LevelEditorLayer;
@@ -100,6 +101,17 @@ namespace mpedit {
 
         std::unordered_map<GameObject*, std::string>& getTrackedSelections() { return m_preSelectSaveStrings; }
 
+        struct IntegrityEntry {
+            std::string uuid;
+            std::string hash;
+        };
+        std::pair<uint32_t, std::string> computeLevelDigest() const;
+        std::vector<IntegrityEntry> buildLevelManifest() const;
+        std::vector<ActionSerializer::ObjectData> getObjectDataForUuids(
+            std::vector<std::string> const& uuids) const;
+        void sendLevelDigestTo(int playerId);
+        void sendLevelManifestTo(int playerId);
+
     private:
         RemoteActionHandler() = default;
         ~RemoteActionHandler() = default;
@@ -148,6 +160,16 @@ namespace mpedit {
             geode::Ref<GameObject> obj;
         };
         std::vector<PendingPlacement> m_pendingPlacements;
+
+        struct RepairManifestState {
+            bool active = false;
+            int hostPlayerId = -1;
+            uint32_t scanId = 0;
+            uint32_t totalChunks = 0;
+            std::vector<bool> received;
+            std::vector<IntegrityEntry> entries;
+        };
+        RepairManifestState m_repairManifest;
 
         struct QueuedAction {
             enum class Type { Place, Delete, Move, Transform, Reconcile, Update };

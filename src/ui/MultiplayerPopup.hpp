@@ -14,6 +14,12 @@ namespace mpedit {
         cocos2d::CCMenu* m_sessionMenu = nullptr;
         cocos2d::CCNode* m_contentNode = nullptr;
 
+        // v0.5.2 connection diagnostics. This is UI-only state and does not
+        // affect signaling/WebRTC behavior or the wire protocol.
+        bool m_connectionPending = false;
+        float m_connectionElapsed = 0.f;
+        int m_lastConnectionStage = -1;
+
         ~MultiplayerPopup();
 
         bool setup();
@@ -27,6 +33,8 @@ namespace mpedit {
         void onJoin(cocos2d::CCObject*);
         void onLeave(cocos2d::CCObject*);
         void onCopyCode(cocos2d::CCObject*);
+        void onKick(cocos2d::CCObject*);
+        void onRoomSettings(cocos2d::CCObject*);
         void onPatreon(cocos2d::CCObject*);
         void pollNetwork(float dt);
 

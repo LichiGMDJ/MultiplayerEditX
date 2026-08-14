@@ -1,5 +1,6 @@
 #include "MultiplayerPopup.hpp"
 #include "UpdateHelperNode.hpp"
+#include "RoomSettingsPopup.hpp"
 #include "../SessionManager.hpp"
 #include "../P2PManager.hpp"
 #include <Geode/Geode.hpp>
@@ -215,6 +216,25 @@ namespace mpedit {
             label->setPosition({center.width, yOffset});
             label->setColor(colors[player.colorIndex % colors.size()]);
             m_contentNode->addChild(label);
+
+            if (
+                session.getRole() == SessionManager::Role::Host &&
+                player.id != session.getLocalPlayerId()
+            ) {
+                auto* kickMenu = CCMenu::create();
+                kickMenu->setPosition({0.f, 0.f});
+                auto* kickSprite = ButtonSprite::create(
+                    "X", 28, true, "bigFont.fnt", "GJ_button_06.png", 18.f, 0.5f
+                );
+                auto* kickButton = CCMenuItemSpriteExtra::create(
+                    kickSprite, this, menu_selector(MultiplayerPopup::onKick)
+                );
+                kickButton->setTag(player.id);
+                kickButton->setPosition({center.width + 105.f, yOffset});
+                kickMenu->addChild(kickButton);
+                m_contentNode->addChild(kickMenu);
+            }
+
             yOffset -= 18.f;
         }
 
@@ -233,6 +253,18 @@ namespace mpedit {
         copyBtn->setPosition({center.width - 60.f, 40.f});
         copyBtn->setID("copy-button"_spr);
         m_sessionMenu->addChild(copyBtn);
+
+        if (session.getRole() == SessionManager::Role::Host) {
+            auto* settingsSprite = ButtonSprite::create(
+                "Settings", 82, true, "bigFont.fnt", "GJ_button_05.png", 24.f, 0.55f
+            );
+            auto* settingsBtn = CCMenuItemSpriteExtra::create(
+                settingsSprite, this, menu_selector(MultiplayerPopup::onRoomSettings)
+            );
+            settingsBtn->setPosition({center.width, 72.f});
+            settingsBtn->setID("room-settings-button"_spr);
+            m_sessionMenu->addChild(settingsBtn);
+        }
 
         // Leave button
         auto* leaveSprite = ButtonSprite::create(
@@ -343,6 +375,9 @@ namespace mpedit {
                 fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());
             }
             
+            m_connectionPending = false;
+            m_connectionElapsed = 0.f;
+            m_lastConnectionStage = -1;
             this->clearContentNode();
             this->createConnectView();
             
@@ -374,15 +409,20 @@ namespace mpedit {
 
         Mod::get()->setSettingValue<std::string>("player-name", name);
 
+        m_connectionPending = true;
+        m_connectionElapsed = 0.f;
+        m_lastConnectionStage = -1;
         if (m_statusLabel) {
-            m_statusLabel->setString("Joining...");
+            m_statusLabel->setString("Stage 1/4: Contacting signaling server...");
             m_statusLabel->setColor({255, 255, 100});
         }
 
         auto& session = SessionManager::get();
 
         session.onSessionStarted([this]() {
-            createLoadingView("Waiting for level sync from host...");
+            createLoadingView("Stage 2/4: Negotiating WebRTC / ICE...");
+            m_connectionPending = true;
+            m_lastConnectionStage = 2;
         });
 
         session.onError([this](std::string const& error) {
@@ -408,6 +448,9 @@ namespace mpedit {
     }
 
     void MultiplayerPopup::onLeave(CCObject*) {
+        m_connectionPending = false;
+        m_connectionElapsed = 0.f;
+        m_lastConnectionStage = -1;
         auto& session = SessionManager::get();
         auto role = session.getRole();
         session.leaveSession();
@@ -452,12 +495,95 @@ namespace mpedit {
         Notification::create("Room code copied!", NotificationIcon::Success)->show();
     }
 
+    void MultiplayerPopup::onRoomSettings(CCObject*) {
+        if (SessionManager::get().getRole() != SessionManager::Role::Host) return;
+        RoomSettingsPopup::create()->show();
+    }
+
+    void MultiplayerPopup::onKick(CCObject* sender) {
+        if (SessionManager::get().getRole() != SessionManager::Role::Host || !sender) return;
+        auto* node = typeinfo_cast<CCNode*>(sender);
+        if (!node) return;
+        int playerId = node->getTag();
+        if (playerId <= 0) return;
+        P2PManager::get().kickPlayer(playerId);
+        Notification::create("Player kicked", NotificationIcon::Info)->show();
+    }
+
     void MultiplayerPopup::onPatreon(CCObject*) {
         geode::utils::web::openLinkInBrowser("https://www.patreon.com/cw/d050/membership");
     }
 
     void MultiplayerPopup::pollNetwork(float dt) {
-        P2PManager::get().dispatchMessages();
+        auto& net = P2PManager::get();
+
+        // dispatchMessages() can synchronously invoke callbacks that rebuild or
+        // close this popup. Therefore all optional UI access must happen before
+        // dispatch, and dispatch must be the final operation in this timer tick.
+        if (!m_connectionPending || !m_statusLabel) {
+            net.dispatchMessages();
+            return;
+        }
+
+        m_connectionElapsed += dt;
+        auto state = net.getState();
+        auto& session = SessionManager::get();
+
+        std::string text;
+        cocos2d::ccColor3B color = {255, 255, 100};
+        int stage = m_lastConnectionStage;
+
+        if (state == P2PManager::State::Error) {
+            text = net.getError().empty()
+                ? "Connection failed: unknown network error"
+                : "Connection failed: " + net.getError();
+            color = {255, 100, 100};
+            stage = 99;
+            m_connectionPending = false;
+        } else if (state == P2PManager::State::Reconnecting) {
+            text = "Reconnecting: signaling / ICE negotiation...";
+            stage = 5;
+        } else if (session.getLocalPlayerId() < 0) {
+            text = "Stage 1/4: Signaling - joining room...";
+            stage = 1;
+        } else if (state == P2PManager::State::Connecting) {
+            text = "Stage 2/4: WebRTC - ICE / STUN / TURN negotiation...";
+            stage = 2;
+        } else if (state == P2PManager::State::Connected) {
+            // Once WebRTC reports Connected, both data channels / protocol
+            // bootstrap are the remaining path before the authoritative level
+            // snapshot opens the editor and closes this loading popup.
+            text = "Stage 3/4: P2P connected - waiting for level sync...";
+            color = {140, 255, 140};
+            stage = 3;
+        } else if (state == P2PManager::State::Disconnected) {
+            text = "Disconnected while joining room";
+            color = {255, 100, 100};
+            stage = 98;
+        }
+
+        if (m_connectionElapsed >= 20.f &&
+            (state == P2PManager::State::Connecting || state == P2PManager::State::Reconnecting)) {
+            text += "\nTaking unusually long - check TURN password / network";
+            color = {255, 190, 90};
+        }
+
+        if (stage != m_lastConnectionStage || m_connectionElapsed >= 20.f) {
+            log::info(
+                "MultiplayerPopup: connection diagnostic stage={} elapsed={:.1f}s state={}",
+                stage,
+                m_connectionElapsed,
+                static_cast<int>(state)
+            );
+            m_lastConnectionStage = stage;
+        }
+
+        m_statusLabel->setString(text.c_str());
+        m_statusLabel->setColor(color);
+        m_statusLabel->setScale(text.find('\n') == std::string::npos ? 0.55f : 0.44f);
+
+        // Must remain last. A callback reached from here may destroy the popup.
+        net.dispatchMessages();
     }
 
 } // namespace mpedit

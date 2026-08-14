@@ -325,6 +325,179 @@ namespace mpedit::proto {
         return std::move(w.takeData());
     }
 
+    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion) {
+        Writer w;
+        w.writeOpcode(Opcode::ProtocolHello);
+        w.writeVarInt(protocolVersion);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeReliableEnvelope(
+        uint32_t sequence, std::vector<uint8_t> const& payload)
+    {
+        Writer w(payload.size() + 16);
+        w.writeOpcode(Opcode::ReliableEnvelope);
+        w.writeVarInt(sequence);
+        w.writeVarInt(static_cast<uint32_t>(payload.size()));
+        if (!payload.empty()) w.writeBytes(payload.data(), payload.size());
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeReliableAck(uint32_t sequence) {
+        Writer w;
+        w.writeOpcode(Opcode::ReliableAck);
+        w.writeVarInt(sequence);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeLevelDigest(uint32_t objectCount, std::string const& hash) {
+        Writer w;
+        w.writeOpcode(Opcode::LevelDigest);
+        w.writeVarInt(objectCount);
+        w.writeString(hash);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeLevelManifest(
+        uint32_t scanId, uint32_t chunkIndex, uint32_t totalChunks,
+        std::vector<LevelManifestEntry> const& entries)
+    {
+        Writer w;
+        w.writeOpcode(Opcode::LevelManifest);
+        w.writeVarInt(scanId);
+        w.writeVarInt(chunkIndex);
+        w.writeVarInt(totalChunks);
+        w.writeVarInt(static_cast<uint32_t>(entries.size()));
+        for (auto const& entry : entries) {
+            w.writeString(entry.uuid);
+            w.writeString(entry.hash);
+        }
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeLevelRepairRequest(
+        uint32_t scanId,
+        std::vector<std::string> const& missing,
+        std::vector<std::string> const& changed)
+    {
+        Writer w;
+        w.writeOpcode(Opcode::LevelRepairRequest);
+        w.writeVarInt(scanId);
+        w.writeVarInt(static_cast<uint32_t>(missing.size()));
+        for (auto const& uuid : missing) w.writeString(uuid);
+        w.writeVarInt(static_cast<uint32_t>(changed.size()));
+        for (auto const& uuid : changed) w.writeString(uuid);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeFullResyncRequest() {
+        Writer w;
+        w.writeOpcode(Opcode::FullResyncRequest);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeInitialSyncRequest() {
+        Writer w;
+        w.writeOpcode(Opcode::InitialSyncRequest);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeBulkPasteStart(
+        uint32_t pasteId, uint32_t totalChunks, uint32_t totalObjects,
+        bool withColor, bool noUndo, float anchorX, float anchorY)
+    {
+        Writer w;
+        w.writeOpcode(Opcode::BulkPasteStart);
+        w.writeVarInt(pasteId);
+        w.writeVarInt(totalChunks);
+        w.writeVarInt(totalObjects);
+        w.writeBool(withColor);
+        w.writeBool(noUndo);
+        w.writeF32(anchorX);
+        w.writeF32(anchorY);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeBulkPasteChunk(
+        uint32_t pasteId, uint32_t chunkIndex, std::string const& data,
+        std::vector<std::string> const& uuids)
+    {
+        Writer w(data.size() + uuids.size() * 40 + 32);
+        w.writeOpcode(Opcode::BulkPasteChunk);
+        w.writeVarInt(pasteId);
+        w.writeVarInt(chunkIndex);
+        w.writeString(data);
+        w.writeVarInt(static_cast<uint32_t>(uuids.size()));
+        for (auto const& uuid : uuids) w.writeString(uuid);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeBulkPasteEnd(uint32_t pasteId) {
+        Writer w;
+        w.writeOpcode(Opcode::BulkPasteEnd);
+        w.writeVarInt(pasteId);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeGlobalRevision(uint32_t revision, int authorPlayerId) {
+        Writer w;
+        w.writeOpcode(Opcode::GlobalRevision);
+        w.writeVarInt(revision);
+        w.writeI32(authorPlayerId);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeSharedDigest(
+        uint32_t revision, uint32_t objectCount, std::string const& hash)
+    {
+        Writer w;
+        w.writeOpcode(Opcode::SharedDigest);
+        w.writeVarInt(revision);
+        w.writeVarInt(objectCount);
+        w.writeString(hash);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeGlobalSnapshotRequest(uint32_t revision) {
+        Writer w;
+        w.writeOpcode(Opcode::GlobalSnapshotRequest);
+        w.writeVarInt(revision);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeKickPlayer(int targetPlayerId, std::string const& reason) {
+        Writer w;
+        w.writeOpcode(Opcode::KickPlayer);
+        w.writeI32(targetPlayerId);
+        w.writeString(reason);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeMusicChanged(int songID, int audioTrack, std::string const& title) {
+        Writer w;
+        w.writeOpcode(Opcode::MusicChanged);
+        w.writeI32(songID);
+        w.writeI32(audioTrack);
+        w.writeString(title);
+        return std::move(w.takeData());
+    }
+
+    std::vector<uint8_t> serializeRoomSettingsChanged(
+        uint32_t maxPlayers, bool allowBuild, bool allowDelete, bool allowWorkshop,
+        bool allowLevelSettings, bool autoRepair, bool locked)
+    {
+        Writer w;
+        w.writeOpcode(Opcode::RoomSettingsChanged);
+        w.writeVarInt(maxPlayers);
+        w.writeBool(allowBuild);
+        w.writeBool(allowDelete);
+        w.writeBool(allowWorkshop);
+        w.writeBool(allowLevelSettings);
+        w.writeBool(autoRepair);
+        w.writeBool(locked);
+        return std::move(w.takeData());
+    }
+
     std::vector<uint8_t> serializeError(std::string const& message) {
         Writer w;
         w.writeOpcode(Opcode::Error);
@@ -470,6 +643,144 @@ namespace mpedit::proto {
     PlayerLeftMsg deserializePlayerLeft(Reader& r) {
         PlayerLeftMsg msg;
         msg.playerId = static_cast<int>(r.readVarInt());
+        return msg;
+    }
+
+    ProtocolHelloMsg deserializeProtocolHello(Reader& r) {
+        ProtocolHelloMsg msg;
+        msg.protocolVersion = r.readVarInt();
+        return msg;
+    }
+
+    ReliableEnvelopeMsg deserializeReliableEnvelope(Reader& r) {
+        ReliableEnvelopeMsg msg;
+        msg.sequence = r.readVarInt();
+        uint32_t len = r.readVarInt();
+        if (r.hasError() || len > r.remaining()) return msg;
+        msg.payload.assign(r.currentPtr(), r.currentPtr() + len);
+        r.skip(len);
+        return msg;
+    }
+
+    ReliableAckMsg deserializeReliableAck(Reader& r) {
+        ReliableAckMsg msg;
+        msg.sequence = r.readVarInt();
+        return msg;
+    }
+
+    LevelDigestMsg deserializeLevelDigest(Reader& r) {
+        LevelDigestMsg msg;
+        msg.objectCount = r.readVarInt();
+        msg.hash = r.readString();
+        return msg;
+    }
+
+    LevelManifestMsg deserializeLevelManifest(Reader& r) {
+        LevelManifestMsg msg;
+        msg.scanId = r.readVarInt();
+        msg.chunkIndex = r.readVarInt();
+        msg.totalChunks = r.readVarInt();
+        uint32_t count = r.readVarInt();
+        msg.entries.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            LevelManifestEntry entry;
+            entry.uuid = r.readString();
+            entry.hash = r.readString();
+            msg.entries.push_back(std::move(entry));
+        }
+        return msg;
+    }
+
+    LevelRepairRequestMsg deserializeLevelRepairRequest(Reader& r) {
+        LevelRepairRequestMsg msg;
+        msg.scanId = r.readVarInt();
+        uint32_t missingCount = r.readVarInt();
+        msg.missing.reserve(missingCount);
+        for (uint32_t i = 0; i < missingCount; ++i) msg.missing.push_back(r.readString());
+        uint32_t changedCount = r.readVarInt();
+        msg.changed.reserve(changedCount);
+        for (uint32_t i = 0; i < changedCount; ++i) msg.changed.push_back(r.readString());
+        return msg;
+    }
+
+    FullResyncRequestMsg deserializeFullResyncRequest(Reader&) {
+        return {};
+    }
+
+    BulkPasteStartMsg deserializeBulkPasteStart(Reader& r) {
+        BulkPasteStartMsg msg;
+        msg.pasteId = r.readVarInt();
+        msg.totalChunks = r.readVarInt();
+        msg.totalObjects = r.readVarInt();
+        msg.withColor = r.readBool();
+        msg.noUndo = r.readBool();
+        msg.anchorX = r.readF32();
+        msg.anchorY = r.readF32();
+        return msg;
+    }
+
+    BulkPasteChunkMsg deserializeBulkPasteChunk(Reader& r) {
+        BulkPasteChunkMsg msg;
+        msg.pasteId = r.readVarInt();
+        msg.chunkIndex = r.readVarInt();
+        msg.data = r.readString();
+        uint32_t count = r.readVarInt();
+        msg.uuids.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) msg.uuids.push_back(r.readString());
+        return msg;
+    }
+
+    BulkPasteEndMsg deserializeBulkPasteEnd(Reader& r) {
+        BulkPasteEndMsg msg;
+        msg.pasteId = r.readVarInt();
+        return msg;
+    }
+
+    GlobalRevisionMsg deserializeGlobalRevision(Reader& r) {
+        GlobalRevisionMsg msg;
+        msg.revision = r.readVarInt();
+        msg.authorPlayerId = r.readI32();
+        return msg;
+    }
+
+    SharedDigestMsg deserializeSharedDigest(Reader& r) {
+        SharedDigestMsg msg;
+        msg.revision = r.readVarInt();
+        msg.objectCount = r.readVarInt();
+        msg.hash = r.readString();
+        return msg;
+    }
+
+    GlobalSnapshotRequestMsg deserializeGlobalSnapshotRequest(Reader& r) {
+        GlobalSnapshotRequestMsg msg;
+        msg.revision = r.readVarInt();
+        return msg;
+    }
+
+    KickPlayerMsg deserializeKickPlayer(Reader& r) {
+        KickPlayerMsg msg;
+        msg.targetPlayerId = r.readI32();
+        msg.reason = r.readString();
+        return msg;
+    }
+
+    MusicChangedMsg deserializeMusicChanged(Reader& r) {
+        MusicChangedMsg msg;
+        msg.songID = r.readI32();
+        msg.audioTrack = r.readI32();
+        msg.title = r.readString();
+        return msg;
+    }
+
+    RoomSettingsChangedMsg deserializeRoomSettingsChanged(Reader& r) {
+        RoomSettingsChangedMsg msg;
+        msg.maxPlayers = r.readVarInt();
+        msg.allowBuild = r.readBool();
+        msg.allowDelete = r.readBool();
+        msg.allowWorkshop = r.readBool();
+        msg.allowLevelSettings = r.readBool();
+        msg.autoRepair = r.readBool();
+        msg.locked = r.readBool();
         return msg;
     }
 

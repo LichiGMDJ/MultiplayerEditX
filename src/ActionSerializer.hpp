@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <utility>
 
 // Forward declarations for GD types
 class GameObject;
@@ -79,6 +81,9 @@ namespace mpedit {
         
         std::unordered_map<std::string, std::string> parseSaveString(std::string const& str);
         std::string buildSaveString(std::unordered_map<std::string, std::string> const& map);
+        std::vector<std::pair<std::string, std::string>> parseSaveStringOrdered(std::string const& str);
+        std::string buildSaveStringOrdered(
+            std::vector<std::pair<std::string, std::string>> const& vec);
         void injectLocalStartPosState(ObjectData& remoteData, GameObject* localObj);
 
         // Returns true if there are changes between two save strings, excluding transform properties

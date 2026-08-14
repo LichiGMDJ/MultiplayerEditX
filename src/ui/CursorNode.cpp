@@ -125,7 +125,43 @@ namespace mpedit {
             }
             
             pc.drawNode->setPosition({newX, newY});
-            pc.label->setString(player.name.c_str());
+
+            std::string playerLabel = player.name;
+            auto musicPos = player.status.rfind(":music:");
+            if (musicPos != std::string::npos) {
+                auto musicData = player.status.substr(musicPos + 7);
+                auto sep = musicData.find(':');
+                if (sep != std::string::npos) {
+                    auto secondSep = musicData.find(':', sep + 1);
+                    std::string audioPart = secondSep == std::string::npos
+                        ? musicData.substr(sep + 1)
+                        : musicData.substr(sep + 1, secondSep - sep - 1);
+                    int songId = geode::utils::numFromString<int>(musicData.substr(0, sep)).unwrapOr(0);
+                    int audioTrack = geode::utils::numFromString<int>(audioPart).unwrapOr(0);
+                    std::string transmittedTitle = secondSep == std::string::npos
+                        ? std::string()
+                        : musicData.substr(secondSep + 1);
+
+                    std::string songText = transmittedTitle;
+                    if (songText.empty() && songId > 0) {
+                        if (auto* song = LevelTools::getSongObject(songId)) {
+                            std::string songName = song->m_songName.c_str();
+                            std::string artistName = song->m_artistName.c_str();
+                            if (!songName.empty()) songText = artistName.empty() ? songName : artistName + " - " + songName;
+                        }
+                        if (songText.empty()) songText = "ID " + std::to_string(songId);
+                    } else if (songText.empty() && audioTrack >= 0) {
+                        songText = LevelTools::getAudioTitle(audioTrack);
+                        if (songText.empty()) songText = "GD " + std::to_string(audioTrack);
+                    }
+
+                    if (!songText.empty()) {
+                        if (songText.size() > 42) songText = songText.substr(0, 39) + "...";
+                        playerLabel += "  [♪ " + songText + "]";
+                    }
+                }
+            }
+            pc.label->setString(playerLabel.c_str());
 
             // Rebuild toolIndicator if status changed
             if (player.status != pc.lastStatus) {

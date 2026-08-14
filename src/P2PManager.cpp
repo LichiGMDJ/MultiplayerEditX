@@ -11,7 +11,28 @@ using namespace geode::prelude;
 
 namespace mpedit {
 
+    namespace {
+        constexpr uint32_t kProtocolVersion = 7;
 
+        uint64_t reliabilityNowMs() {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count());
+        }
+
+        bool isGlobalEditOpcode(uint8_t raw) {
+            auto opcode = static_cast<proto::Opcode>(raw);
+            return
+                opcode == proto::Opcode::PlaceObjects ||
+                opcode == proto::Opcode::DeleteObjects ||
+                opcode == proto::Opcode::MoveObjects ||
+                opcode == proto::Opcode::TransformObjects ||
+                opcode == proto::Opcode::ReconcileObjects ||
+                opcode == proto::Opcode::UpdateObjects ||
+                opcode == proto::Opcode::UpdateSettings ||
+                opcode == proto::Opcode::BulkPasteEnd;
+        }
+    }
 
     P2PManager& P2PManager::get() {
         static P2PManager instance;
@@ -32,14 +53,43 @@ namespace mpedit {
         rtc::Configuration config;
         config.iceServers.push_back({"stun:stun.l.google.com:19302"});
         config.iceServers.push_back({"stun:stun.cloudflare.com:3478"});
-        rtc::IceServer turn("openrelay.metered.ca", 443, "openrelayproject", "openrelayproject", rtc::IceServer::RelayType::TurnTcp);
-        config.iceServers.push_back(turn);
+        auto turnHost = Mod::get()->getSettingValue<std::string>("turn-host");
+        auto turnUsername = Mod::get()->getSettingValue<std::string>("turn-username");
+        auto turnPassword = Mod::get()->getSettingValue<std::string>("turn-password");
+        auto forceTurnRelay = Mod::get()->getSettingValue<bool>("force-turn-relay");
+
+        if (turnHost.empty()) turnHost = "194.226.126.115";
+        if (turnUsername.empty()) turnUsername = "mpedit";
+
+        // Normal mode is ICE automatic selection: host/srflx (direct/STUN)
+        // candidates are preferred by ICE and TURN remains available as a
+        // relay candidate only when a direct route cannot be established.
+        // Force TURN is intentionally diagnostic-only.
+        if (!turnPassword.empty()) {
+            rtc::IceServer turn(
+                turnHost,
+                3478,
+                turnUsername,
+                turnPassword,
+                rtc::IceServer::RelayType::TurnUdp
+            );
+            config.iceServers.push_back(turn);
+
+            if (forceTurnRelay) {
+                config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+                log::warn("P2PManager: Force TURN diagnostic mode enabled");
+            } else {
+                log::info("P2PManager: ICE auto mode: direct/STUN preferred, TURN fallback available");
+            }
+        } else {
+            log::info("P2PManager: ICE direct/STUN mode; no TURN credentials configured");
+        }
         return config;
     }
 
     std::string P2PManager::getSignalingUrl() {
         auto url = Mod::get()->getSettingValue<std::string>("signaling-url");
-        if (url.empty()) return "https://dewy-flea-9364.d050.deno.net";
+        if (url.empty()) return "https://194.226.126.115:8443";
         return url;
     }
 
@@ -70,6 +120,59 @@ namespace mpedit {
     std::string P2PManager::getError() const {
         std::lock_guard lock(m_stateMutex);
         return m_error;
+    }
+
+    bool P2PManager::isPeerReconnect(int playerId) {
+        std::lock_guard lock(m_peersMutex);
+        auto it = m_peers.find(playerId);
+        return it != m_peers.end() && it->second.reconnecting;
+    }
+
+    P2PManager::RoomSettings P2PManager::getRoomSettings() const {
+        std::lock_guard lock(m_roomSettingsMutex);
+        return m_roomSettings;
+    }
+
+    void P2PManager::setRoomSettings(RoomSettings const& settings) {
+        if (m_role != Role::Host) return;
+        RoomSettings safe = settings;
+        safe.maxPlayers = std::clamp<uint32_t>(safe.maxPlayers, 2, 16);
+        {
+            std::lock_guard lock(m_roomSettingsMutex);
+            m_roomSettings = safe;
+        }
+        auto packet = proto::serializeRoomSettingsChanged(
+            safe.maxPlayers, safe.allowBuild, safe.allowDelete, safe.allowWorkshop,
+            safe.allowLevelSettings, safe.autoRepair, safe.locked
+        );
+        broadcast(packet, ChannelType::Reliable);
+        log::info(
+            "P2PManager: ROOM SETTINGS max={} build={} delete={} workshop={} settings={} repair={} locked={}",
+            safe.maxPlayers, safe.allowBuild, safe.allowDelete, safe.allowWorkshop,
+            safe.allowLevelSettings, safe.autoRepair, safe.locked
+        );
+    }
+
+    void P2PManager::kickPlayer(int playerId) {
+        if (m_role != Role::Host || playerId <= 0) return;
+
+        std::string name;
+        {
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(playerId);
+            if (it == m_peers.end()) return;
+            name = it->second.playerName;
+            if (!name.empty()) m_kickedNames.insert(name);
+        }
+
+        auto packet = proto::serializeKickPlayer(playerId, "Kicked by host");
+        sendTo(playerId, packet, ChannelType::Reliable);
+        log::warn("P2PManager: host kicked player {} ({})", playerId, name);
+
+        std::thread([this, playerId]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            onPeerDisconnected(playerId, false);
+        }).detach();
     }
 
 
@@ -106,6 +209,8 @@ namespace mpedit {
 
 
     void P2PManager::dispatchMessages() {
+        flushBulkReliableQueues();
+
         if (m_dispatching) return;
         m_dispatching = true;
 
@@ -126,7 +231,29 @@ namespace mpedit {
                     auto handlersCopy = it->second;
                     for (auto const& handler : handlersCopy) {
                         proto::Reader handlerReader(msg.data.data() + 1, msg.data.size() - 1);
-                        handler(msg.fromPlayerId, handlerReader);
+                        try {
+                            handler(msg.fromPlayerId, handlerReader);
+                            if (handlerReader.hasError()) {
+                                log::warn(
+                                    "P2PManager: malformed payload rejected (opcode={}, from={})",
+                                    static_cast<int>(opcodeRaw),
+                                    msg.fromPlayerId
+                                );
+                            }
+                        } catch (std::exception const& e) {
+                            log::error(
+                                "P2PManager: message handler contained exception (opcode={}, from={}): {}",
+                                static_cast<int>(opcodeRaw),
+                                msg.fromPlayerId,
+                                e.what()
+                            );
+                        } catch (...) {
+                            log::error(
+                                "P2PManager: message handler contained unknown exception (opcode={}, from={})",
+                                static_cast<int>(opcodeRaw),
+                                msg.fromPlayerId
+                            );
+                        }
                         if (m_handlers.empty()) break;
                     }
                 }
@@ -144,6 +271,13 @@ namespace mpedit {
     void P2PManager::send(std::vector<uint8_t> const& data, ChannelType channel) {
         if (m_role == Role::Host) {
             broadcast(data, channel);
+            if (!data.empty() && isGlobalEditOpcode(data[0])) {
+                uint32_t revision = m_globalRevision.fetch_add(1) + 1;
+                m_lastGlobalAuthor.store(0);
+                auto rev = proto::serializeGlobalRevision(revision, 0);
+                broadcast(rev, ChannelType::Reliable);
+                log::debug("P2PManager: GLOBAL REV {} author=host opcode={}", revision, static_cast<int>(data[0]));
+            }
         } else if (m_role == Role::Client) {
             sendTo(0, data, channel);
         }
@@ -160,13 +294,199 @@ namespace mpedit {
 
         auto& peer = it->second;
         if (!peer.ready) {
+            constexpr size_t kMaxPendingMessagesPerPeer = 512;
+            if (peer.pendingMessages.size() >= kMaxPendingMessagesPerPeer) {
+                log::warn(
+                    "P2PManager: dropping queued message for player {} because pending queue reached {} entries",
+                    playerId,
+                    kMaxPendingMessagesPerPeer
+                );
+                return;
+            }
             peer.pendingMessages.push_back({data, channel});
             return;
         }
         auto& dc = (channel == ChannelType::Reliable) ? peer.reliable : peer.unreliable;
 
         if (dc && dc->isOpen()) {
-            dc->send(reinterpret_cast<const std::byte*>(data.data()), data.size());
+            constexpr size_t kSafeMessageBytes = 24 * 1024;
+
+            auto queueTrackedReliable = [&](std::vector<uint8_t> const& payload) -> bool {
+                constexpr size_t kMaxTrackedReliable = 8192;
+                if (peer.pendingReliableAcks.size() >= kMaxTrackedReliable) {
+                    log::error(
+                        "P2PManager: tracked reliable window full for player {}; opcode {} rejected",
+                        playerId,
+                        payload.empty() ? -1 : static_cast<int>(payload[0])
+                    );
+                    return false;
+                }
+
+                uint32_t sequence = peer.nextReliableSequence++;
+                if (sequence == 0) sequence = peer.nextReliableSequence++;
+                auto envelope = proto::serializeReliableEnvelope(sequence, payload);
+                peer.pendingReliableAcks[sequence] = PeerInfo::PendingAck {
+                    envelope, 0, 0, true
+                };
+                peer.bulkReliableQueue.push_back(std::move(envelope));
+                log::debug(
+                    "P2PManager: TX queued #{} opcode={} player={}",
+                    sequence,
+                    payload.empty() ? -1 : static_cast<int>(payload[0]),
+                    playerId
+                );
+                return true;
+            };
+
+            auto sendRaw = [&](std::vector<uint8_t> const& payload) -> bool {
+                try {
+                    dc->send(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
+                    return true;
+                } catch (std::exception const& e) {
+                    log::error(
+                        "P2PManager: data-channel send failed for player {} ({} bytes): {}",
+                        playerId,
+                        payload.size(),
+                        e.what()
+                    );
+                    return false;
+                } catch (...) {
+                    log::error(
+                        "P2PManager: data-channel send failed for player {} ({} bytes): unknown exception",
+                        playerId,
+                        payload.size()
+                    );
+                    return false;
+                }
+            };
+
+            if (data.size() <= kSafeMessageBytes) {
+                if (channel == ChannelType::Reliable && !data.empty()) {
+                    auto opcode = static_cast<proto::Opcode>(data[0]);
+                    bool orderedEditorTraffic =
+                        opcode == proto::Opcode::PlaceObjects ||
+                        opcode == proto::Opcode::DeleteObjects ||
+                        opcode == proto::Opcode::MoveObjects ||
+                        opcode == proto::Opcode::MoveBatch ||
+                        opcode == proto::Opcode::TransformObjects ||
+                        opcode == proto::Opcode::ReconcileObjects ||
+                        opcode == proto::Opcode::UpdateObjects ||
+                        opcode == proto::Opcode::LockObjects ||
+                        opcode == proto::Opcode::UpdateSettings ||
+                        opcode == proto::Opcode::SyncLevelStart ||
+                        opcode == proto::Opcode::SyncLevelChunk ||
+                        opcode == proto::Opcode::SyncLevelEnd ||
+                        opcode == proto::Opcode::LevelDigest ||
+                        opcode == proto::Opcode::LevelManifest ||
+                        opcode == proto::Opcode::LevelRepairRequest ||
+                        opcode == proto::Opcode::FullResyncRequest ||
+                        opcode == proto::Opcode::BulkPasteStart ||
+                        opcode == proto::Opcode::BulkPasteChunk ||
+                        opcode == proto::Opcode::BulkPasteEnd ||
+                        opcode == proto::Opcode::GlobalRevision ||
+                        opcode == proto::Opcode::SharedDigest ||
+                        opcode == proto::Opcode::GlobalSnapshotRequest ||
+                        opcode == proto::Opcode::KickPlayer ||
+                        opcode == proto::Opcode::MusicChanged ||
+                        opcode == proto::Opcode::RoomSettingsChanged;
+
+                    if (orderedEditorTraffic) {
+                        constexpr size_t kMaxOrderedReliableQueue = 8192;
+                        if (peer.bulkReliableQueue.size() < kMaxOrderedReliableQueue) {
+                            queueTrackedReliable(data);
+                            log::debug(
+                                "P2PManager: queued reliable editor opcode {} for ordered ACK delivery to player {} (queue={})",
+                                static_cast<int>(data[0]),
+                                playerId,
+                                peer.bulkReliableQueue.size()
+                            );
+                        } else {
+                            log::error(
+                                "P2PManager: ordered reliable queue full for player {}; opcode {} could not be retained",
+                                playerId,
+                                static_cast<int>(data[0])
+                            );
+                        }
+                        return;
+                    }
+                }
+
+                // Handshake/session-control traffic and unreliable cursor state
+                // remain immediate. They are low-volume and must work before an
+                // editor network tick exists.
+                sendRaw(data);
+                return;
+            }
+
+            if (
+                channel == ChannelType::Reliable &&
+                !data.empty() &&
+                data[0] == static_cast<uint8_t>(proto::Opcode::PlaceObjects)
+            ) {
+                proto::Reader reader(data.data() + 1, data.size() - 1);
+                auto msg = proto::deserializePlaceObjects(reader);
+                if (reader.hasError()) {
+                    log::warn("P2PManager: refusing to split malformed PlaceObjects payload");
+                    return;
+                }
+
+                std::vector<ActionSerializer::ObjectData> batch;
+                batch.reserve(64);
+                size_t sentObjects = 0;
+
+                auto flushBatch = [&]() -> bool {
+                    if (batch.empty()) return true;
+                    auto payload = proto::serializePlaceObjects(batch);
+                    if (payload.size() > kSafeMessageBytes) {
+                        log::warn(
+                            "P2PManager: dropping oversized PlaceObjects sub-batch ({} objects, {} bytes)",
+                            batch.size(),
+                            payload.size()
+                        );
+                        batch.clear();
+                        return false;
+                    }
+
+                    queueTrackedReliable(payload);
+                    sentObjects += batch.size();
+                    batch.clear();
+                    return true;
+                };
+
+                for (auto const& object : msg.objects) {
+                    batch.push_back(object);
+                    auto probe = proto::serializePlaceObjects(batch);
+                    if (probe.size() > kSafeMessageBytes) {
+                        auto last = std::move(batch.back());
+                        batch.pop_back();
+                        flushBatch();
+
+                        batch.push_back(std::move(last));
+                        auto single = proto::serializePlaceObjects(batch);
+                        if (single.size() > kSafeMessageBytes) {
+                            log::warn(
+                                "P2PManager: one object is too large to synchronize safely ({} bytes); skipping it",
+                                single.size()
+                            );
+                            batch.clear();
+                        }
+                    }
+                }
+                flushBatch();
+
+                log::info(
+                    "P2PManager: queued oversized PlaceObjects payload: {} objects in {} paced SCTP messages",
+                    sentObjects,
+                    peer.bulkReliableQueue.size()
+                );
+                return;
+            }
+
+            log::warn(
+                "P2PManager: dropping oversized unsupported message (opcode={}, {} bytes)",
+                data.empty() ? -1 : static_cast<int>(data[0]),
+                data.size()
+            );
         }
     }
 
@@ -188,11 +508,338 @@ namespace mpedit {
 
 
 
+    void P2PManager::flushBulkReliableQueues() {
+        constexpr size_t kMaxBulkPacketsPerPeerPerTick = 3;
+        constexpr uint64_t kAckTimeoutMs = 900;
+        auto now = reliabilityNowMs();
+
+        std::lock_guard lock(m_peersMutex);
+        for (auto& [playerId, peer] : m_peers) {
+            if (!peer.ready || !peer.reliable || !peer.reliable->isOpen()) continue;
+
+            for (auto& [sequence, pending] : peer.pendingReliableAcks) {
+                if (!pending.queued && pending.lastSentMs > 0 && now - pending.lastSentMs >= kAckTimeoutMs) {
+                    peer.bulkReliableQueue.push_back(pending.envelope);
+                    pending.queued = true;
+                    log::warn(
+                        "P2PManager: RETRY #{} player={} attempt={}",
+                        sequence,
+                        playerId,
+                        pending.attempts + 1
+                    );
+                }
+            }
+
+            size_t sentThisTick = 0;
+            while (!peer.bulkReliableQueue.empty() && sentThisTick < kMaxBulkPacketsPerPeerPerTick) {
+                auto const& payload = peer.bulkReliableQueue.front();
+                try {
+                    peer.reliable->send(
+                        reinterpret_cast<const std::byte*>(payload.data()),
+                        payload.size()
+                    );
+
+                    if (!payload.empty() && payload[0] == static_cast<uint8_t>(proto::Opcode::ReliableEnvelope)) {
+                        proto::Reader sentReader(payload.data() + 1, payload.size() - 1);
+                        auto sentEnvelope = proto::deserializeReliableEnvelope(sentReader);
+                        if (!sentReader.hasError()) {
+                            auto pendingIt = peer.pendingReliableAcks.find(sentEnvelope.sequence);
+                            if (pendingIt != peer.pendingReliableAcks.end()) {
+                                pendingIt->second.lastSentMs = reliabilityNowMs();
+                                pendingIt->second.attempts += 1;
+                                pendingIt->second.queued = false;
+                            }
+                        }
+                    }
+
+                    peer.bulkReliableQueue.erase(peer.bulkReliableQueue.begin());
+                    ++sentThisTick;
+                } catch (std::exception const& e) {
+                    // Keep the packet at the front and retry on a later network tick.
+                    log::warn(
+                        "P2PManager: reliable FIFO send deferred for player {} ({} bytes): {}",
+                        playerId,
+                        payload.size(),
+                        e.what()
+                    );
+                    break;
+                } catch (...) {
+                    log::warn(
+                        "P2PManager: reliable FIFO send deferred for player {} ({} bytes): unknown exception",
+                        playerId,
+                        payload.size()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     void P2PManager::onPeerMessage(int fromPlayerId, const uint8_t* data, size_t len) {
+        constexpr size_t kMaxInboundMessageBytes = 256 * 1024;
+        constexpr size_t kMaxIncomingQueue = 1024;
+        constexpr size_t kMaxPreHandshakeMessages = 64;
+
         if (len == 0) return;
+        if (!data || len > kMaxInboundMessageBytes) {
+            log::warn(
+                "P2PManager: rejected inbound message from player {} ({} bytes)",
+                fromPlayerId,
+                len
+            );
+            return;
+        }
+
+        uint8_t opcode = data[0];
+        if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) {
+            proto::Reader helloReader(data + 1, len - 1);
+            auto hello = proto::deserializeProtocolHello(helloReader);
+            if (helloReader.hasError() || hello.protocolVersion != kProtocolVersion) {
+                log::warn(
+                    "P2PManager: incompatible protocol from player {} (remote={}, local={})",
+                    fromPlayerId,
+                    hello.protocolVersion,
+                    kProtocolVersion
+                );
+
+                auto errorMsg = proto::serializeError(
+                    "Incompatible Multiplayer Edit protocol. Both players must use v0.5.1 or newer compatible builds."
+                );
+                sendTo(fromPlayerId, errorMsg, ChannelType::Reliable);
+
+                if (m_role == Role::Client && fromPlayerId == 0) {
+                    queueInMainThread([this]() {
+                        for (auto& cb : m_onError) {
+                            cb("Incompatible Multiplayer Edit protocol");
+                        }
+                    });
+                }
+                return;
+            }
+
+            std::vector<std::vector<uint8_t>> buffered;
+            {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(fromPlayerId);
+                if (it != m_peers.end()) {
+                    it->second.protocolVerified = true;
+                    it->second.protocolVersion = hello.protocolVersion;
+                    buffered = std::move(it->second.preHandshakeMessages);
+                    it->second.preHandshakeMessages.clear();
+                }
+            }
+            log::info(
+                "P2PManager: protocol v{} verified for player {} (replaying {} buffered packets)",
+                hello.protocolVersion,
+                fromPlayerId,
+                buffered.size()
+            );
+
+            // Data channels being open is not enough to expose the peer to the
+            // editor. Only a mutually compatible protocol handshake may release
+            // pending editor traffic and fire Session/Peer callbacks.
+            finalizePeerHandshake(fromPlayerId);
+
+            for (auto const& packet : buffered) {
+                if (!packet.empty()) {
+                    onPeerMessage(fromPlayerId, packet.data(), packet.size());
+                }
+            }
+            return;
+        }
+
+        bool protocolVerified = false;
+        {
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(fromPlayerId);
+            if (it != m_peers.end()) {
+                protocolVerified = it->second.protocolVerified;
+                if (!protocolVerified) {
+                    if (it->second.preHandshakeMessages.size() < kMaxPreHandshakeMessages) {
+                        it->second.preHandshakeMessages.emplace_back(data, data + len);
+                        log::debug(
+                            "P2PManager: buffered opcode {} from player {} until protocol handshake",
+                            static_cast<int>(opcode),
+                            fromPlayerId
+                        );
+                    } else {
+                        log::warn(
+                            "P2PManager: pre-handshake queue full for player {}; dropping opcode {}",
+                            fromPlayerId,
+                            static_cast<int>(opcode)
+                        );
+                    }
+                }
+            }
+        }
+        if (!protocolVerified) return;
+
+        if (m_role == Role::Host && fromPlayerId > 0) {
+            auto settings = getRoomSettings();
+            auto op = static_cast<proto::Opcode>(opcode);
+            bool denied = false;
+            const char* deniedReason = nullptr;
+
+            if (!settings.allowWorkshop && (
+                op == proto::Opcode::BulkPasteStart ||
+                op == proto::Opcode::BulkPasteChunk ||
+                op == proto::Opcode::BulkPasteEnd
+            )) {
+                denied = true;
+                deniedReason = "Object Workshop is disabled by host";
+            } else if (!settings.allowDelete && op == proto::Opcode::DeleteObjects) {
+                denied = true;
+                deniedReason = "Guest deletion is disabled by host";
+            } else if (!settings.allowLevelSettings && op == proto::Opcode::UpdateSettings) {
+                denied = true;
+                deniedReason = "Level settings are host-only";
+            } else if (!settings.allowBuild && (
+                op == proto::Opcode::PlaceObjects ||
+                op == proto::Opcode::MoveObjects ||
+                op == proto::Opcode::MoveBatch ||
+                op == proto::Opcode::TransformObjects ||
+                op == proto::Opcode::ReconcileObjects ||
+                op == proto::Opcode::UpdateObjects
+            )) {
+                denied = true;
+                deniedReason = "Guest building/editing is disabled by host";
+            }
+
+            if (denied) {
+                log::warn("P2PManager: blocked guest {} opcode {}: {}", fromPlayerId, static_cast<int>(opcode), deniedReason);
+                return;
+            }
+        }
+
+        if (opcode == static_cast<uint8_t>(proto::Opcode::RoomSettingsChanged)) {
+            if (m_role != Role::Client || fromPlayerId != 0) return;
+            proto::Reader roomReader(data + 1, len - 1);
+            auto msg = proto::deserializeRoomSettingsChanged(roomReader);
+            if (roomReader.hasError()) return;
+            RoomSettings settings;
+            settings.maxPlayers = std::clamp<uint32_t>(msg.maxPlayers, 2, 16);
+            settings.allowBuild = msg.allowBuild;
+            settings.allowDelete = msg.allowDelete;
+            settings.allowWorkshop = msg.allowWorkshop;
+            settings.allowLevelSettings = msg.allowLevelSettings;
+            settings.autoRepair = msg.autoRepair;
+            settings.locked = msg.locked;
+            {
+                std::lock_guard lock(m_roomSettingsMutex);
+                m_roomSettings = settings;
+            }
+            log::info("P2PManager: applied ROOM SETTINGS from host");
+            return;
+        }
+
+        if (opcode == static_cast<uint8_t>(proto::Opcode::GlobalRevision)) {
+            proto::Reader revisionReader(data + 1, len - 1);
+            auto msg = proto::deserializeGlobalRevision(revisionReader);
+            if (!revisionReader.hasError()) {
+                uint32_t current = m_globalRevision.load();
+                if (msg.revision >= current) {
+                    m_globalRevision.store(msg.revision);
+                    m_lastGlobalAuthor.store(msg.authorPlayerId);
+                    log::debug("P2PManager: GLOBAL REV applied {} author={}", msg.revision, msg.authorPlayerId);
+                }
+            }
+            return;
+        }
+
+        if (opcode == static_cast<uint8_t>(proto::Opcode::KickPlayer)) {
+            proto::Reader kickReader(data + 1, len - 1);
+            auto msg = proto::deserializeKickPlayer(kickReader);
+            if (kickReader.hasError()) return;
+            if (m_role == Role::Client && msg.targetPlayerId == m_localPlayerId) {
+                m_state.store(State::Error);
+                m_reconnectScheduled.store(false);
+                stopSignalPolling();
+                auto reason = msg.reason.empty() ? std::string("Kicked by host") : msg.reason;
+                queueInMainThread([this, reason]() {
+                    for (auto& cb : m_onError) cb(reason);
+                });
+            }
+            return;
+        }
+
+        if (opcode == static_cast<uint8_t>(proto::Opcode::ReliableAck)) {
+            proto::Reader ackReader(data + 1, len - 1);
+            auto ack = proto::deserializeReliableAck(ackReader);
+            if (ackReader.hasError()) return;
+
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(fromPlayerId);
+            if (it != m_peers.end()) {
+                it->second.pendingReliableAcks.erase(ack.sequence);
+                auto& queue = it->second.bulkReliableQueue;
+                for (auto qit = queue.begin(); qit != queue.end(); ) {
+                    if (!qit->empty() && (*qit)[0] == static_cast<uint8_t>(proto::Opcode::ReliableEnvelope)) {
+                        proto::Reader qr(qit->data() + 1, qit->size() - 1);
+                        auto qm = proto::deserializeReliableEnvelope(qr);
+                        if (!qr.hasError() && qm.sequence == ack.sequence) {
+                            qit = queue.erase(qit);
+                            continue;
+                        }
+                    }
+                    ++qit;
+                }
+                log::debug("P2PManager: ACK #{} from player {}", ack.sequence, fromPlayerId);
+            }
+            return;
+        }
+
+        if (opcode == static_cast<uint8_t>(proto::Opcode::ReliableEnvelope)) {
+            proto::Reader envelopeReader(data + 1, len - 1);
+            auto envelope = proto::deserializeReliableEnvelope(envelopeReader);
+            if (envelopeReader.hasError() || envelope.payload.empty()) {
+                log::warn("P2PManager: malformed reliable envelope from player {}", fromPlayerId);
+                return;
+            }
+
+            auto ack = proto::serializeReliableAck(envelope.sequence);
+            sendTo(fromPlayerId, ack, ChannelType::Reliable);
+
+            bool duplicate = false;
+            {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(fromPlayerId);
+                if (it != m_peers.end()) {
+                    auto& seen = it->second.receivedReliableSequences;
+                    duplicate = seen.contains(envelope.sequence);
+                    if (!duplicate) {
+                        seen.insert(envelope.sequence);
+                        it->second.receivedReliableOrder.push_back(envelope.sequence);
+                        constexpr size_t kMaxRememberedSequences = 4096;
+                        while (it->second.receivedReliableOrder.size() > kMaxRememberedSequences) {
+                            auto old = it->second.receivedReliableOrder.front();
+                            it->second.receivedReliableOrder.pop_front();
+                            seen.erase(old);
+                        }
+                    }
+                }
+            }
+
+            if (duplicate) {
+                log::debug("P2PManager: duplicate #{} from player {} ACKed and ignored", envelope.sequence, fromPlayerId);
+                return;
+            }
+
+            log::debug(
+                "P2PManager: RX #{} opcode={} player={}",
+                envelope.sequence,
+                static_cast<int>(envelope.payload[0]),
+                fromPlayerId
+            );
+            onPeerMessage(fromPlayerId, envelope.payload.data(), envelope.payload.size());
+            return;
+        }
 
         {
             std::lock_guard lock(m_incomingMutex);
+            if (m_incoming.size() >= kMaxIncomingQueue) {
+                log::warn("P2PManager: incoming message queue full; dropping packet from player {}", fromPlayerId);
+                return;
+            }
             m_incoming.push(QueuedMessage{
                 fromPlayerId,
                 std::vector<uint8_t>(data, data + len)
@@ -201,11 +848,31 @@ namespace mpedit {
 
         if (m_role == Role::Host) {
             uint8_t opcode = data[0];
+            if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) return;
+            if (
+                opcode == static_cast<uint8_t>(proto::Opcode::LevelDigest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::LevelManifest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::LevelRepairRequest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::FullResyncRequest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::SharedDigest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::GlobalSnapshotRequest) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::GlobalRevision) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::KickPlayer)
+            ) return;
             ChannelType ch = ChannelType::Reliable;
-            if (opcode == static_cast<uint8_t>(proto::Opcode::CursorUpdate)) {
+            if (opcode == static_cast<uint8_t>(proto::Opcode::CursorUpdate) ||
+                opcode == static_cast<uint8_t>(proto::Opcode::MoveBatch)) {
                 ch = ChannelType::Unreliable;
             }
             relayMessage(fromPlayerId, data, len, ch);
+
+            if (isGlobalEditOpcode(opcode)) {
+                uint32_t revision = m_globalRevision.fetch_add(1) + 1;
+                m_lastGlobalAuthor.store(fromPlayerId);
+                auto rev = proto::serializeGlobalRevision(revision, fromPlayerId);
+                broadcast(rev, ChannelType::Reliable);
+                log::debug("P2PManager: GLOBAL REV {} author={} opcode={}", revision, fromPlayerId, static_cast<int>(opcode));
+            }
         }
     }
 
@@ -219,6 +886,9 @@ namespace mpedit {
             std::lock_guard lock(m_peersMutex);
             auto it = m_peers.find(playerId);
             if (it != m_peers.end()) {
+                if (unexpected && m_role == Role::Host && !it->second.playerName.empty()) {
+                    m_recentDisconnectedNames[it->second.playerName] = reliabilityNowMs();
+                }
                 if (it->second.pc) it->second.pc->close();
                 m_peers.erase(it);
             }
@@ -228,6 +898,11 @@ namespace mpedit {
 
         queueInMainThread([this, playerId, unexpected]() {
             if (m_role == Role::Client && playerId == 0) {
+                if (unexpected) {
+                    m_state.store(State::Reconnecting);
+                    scheduleClientReconnect();
+                    return;
+                }
                 for (auto& cb : m_onError) {
                     cb("Host disconnected");
                 }
@@ -257,6 +932,13 @@ namespace mpedit {
         }
         m_state.store(State::Connecting);
         m_nextPlayerId = 1;
+        {
+            std::lock_guard lock(m_roomSettingsMutex);
+            m_roomSettings = RoomSettings{};
+        }
+        m_globalRevision.store(0);
+        m_lastGlobalAuthor.store(0);
+        m_kickedNames.clear();
 
         signalingCreateRoom(playerName);
     }
@@ -400,7 +1082,7 @@ namespace mpedit {
                         setupPos = sdp.find("a=setup:actpass", setupPos);
                     }
 
-                    log::info("Answer SDP:\n{}", sdp);
+                    log::debug("P2PManager: Received SDP answer ({} bytes)", sdp.size());
                     std::lock_guard lock(m_peersMutex);
                     auto it = m_peers.find(clientId);
                     if (it != m_peers.end() && it->second.pc) {
@@ -475,6 +1157,8 @@ namespace mpedit {
             m_error.clear();
         }
         m_state.store(State::Connecting);
+        m_globalRevision.store(0);
+        m_lastGlobalAuthor.store(0);
 
         signalingJoinRoom(roomCode, playerName);
     }
@@ -498,6 +1182,11 @@ namespace mpedit {
                     auto hostName = json.get<std::string>("hostName").unwrapOr("Host");
 
                     if (m_localPlayerId < 0) {
+                        if (m_state.load() == State::Reconnecting) {
+                            log::warn("P2PManager: reconnect response had no playerId; retrying");
+                            scheduleClientReconnect();
+                            return;
+                        }
                         std::vector<ErrorCb> callbacks;
                         std::string err;
                         {
@@ -631,6 +1320,11 @@ namespace mpedit {
                     startSignalPolling(roomCode, "client", m_localPlayerId);
 
                 } else if (res.code() == 404) {
+                    if (m_state.load() == State::Reconnecting) {
+                        log::warn("P2PManager: reconnect join returned 404; retrying");
+                        scheduleClientReconnect();
+                        return;
+                    }
                     std::vector<ErrorCb> callbacks;
                     std::string err;
                     {
@@ -642,6 +1336,11 @@ namespace mpedit {
                     }
                     for (auto& cb : callbacks) cb(err);
                 } else {
+                    if (m_state.load() == State::Reconnecting) {
+                        log::warn("P2PManager: reconnect join failed with {}; retrying", res.code());
+                        scheduleClientReconnect();
+                        return;
+                    }
                     std::vector<ErrorCb> callbacks;
                     std::string err;
                     {
@@ -675,6 +1374,16 @@ namespace mpedit {
         peer.playerId = clientPlayerId;
         peer.playerName = clientName;
         peer.colorIndex = clientPlayerId % 6;
+
+        auto recentIt = m_recentDisconnectedNames.find(clientName);
+        if (recentIt != m_recentDisconnectedNames.end()) {
+            constexpr uint64_t kReconnectIdentityWindowMs = 20000;
+            if (reliabilityNowMs() - recentIt->second <= kReconnectIdentityWindowMs) {
+                peer.reconnecting = true;
+                log::info("P2PManager: player {} ({}) classified as reconnect", clientPlayerId, clientName);
+            }
+            m_recentDisconnectedNames.erase(recentIt);
+        }
 
         auto setupChannelCallbacks = [this, clientPlayerId](std::shared_ptr<rtc::DataChannel> dc, bool isReliable) {
             dc->onOpen([this, clientPlayerId, isReliable]() {
@@ -771,8 +1480,7 @@ namespace mpedit {
 
 
 
-    void P2PManager::checkPeerReady(int playerId) {
-        bool becameReady = false;
+    void P2PManager::finalizePeerHandshake(int playerId) {
         int pid = -1;
         std::string name;
         int colorIdx = 0;
@@ -784,24 +1492,58 @@ namespace mpedit {
             if (it == m_peers.end()) return;
 
             auto& peer = it->second;
-            bool reliableOpen = peer.reliable && peer.reliable->isOpen();
-            bool unreliableOpen = peer.unreliable && peer.unreliable->isOpen();
+            if (!peer.ready || !peer.protocolVerified || peer.connectionAnnounced) return;
 
-            if (reliableOpen && unreliableOpen && !peer.ready) {
-                peer.ready = true;
-                pid = peer.playerId;
-                name = peer.playerName;
-                colorIdx = peer.colorIndex;
-                becameReady = true;
+            peer.connectionAnnounced = true;
+            pid = peer.playerId;
+            name = peer.playerName;
+            colorIdx = peer.colorIndex;
+            pending = std::move(peer.pendingMessages);
+            peer.pendingMessages.clear();
+        }
 
-                pending = std::move(peer.pendingMessages);
-                peer.pendingMessages.clear();
+        if (m_role == Role::Host && m_kickedNames.contains(name)) {
+            log::warn("P2PManager: rejected session-banned player {} ({})", pid, name);
+            kickPlayer(pid);
+            return;
+        }
 
-                log::info("P2PManager: Player {} ({}) fully connected", pid, name);
+        if (m_role == Role::Host && pid > 0 && !isPeerReconnect(pid)) {
+            auto settings = getRoomSettings();
+            size_t peerCount = 0;
+            {
+                std::lock_guard lock(m_peersMutex);
+                peerCount = m_peers.size() + 1; // + host
+            }
+            std::string rejection;
+            if (settings.locked) rejection = "Room is locked by host";
+            else if (peerCount > settings.maxPlayers) rejection = "Room is full";
+            if (!rejection.empty()) {
+                auto packet = proto::serializeKickPlayer(pid, rejection);
+                sendTo(pid, packet, ChannelType::Reliable);
+                log::warn("P2PManager: rejected player {}: {}", pid, rejection);
+                std::thread([this, pid]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    onPeerDisconnected(pid, false);
+                }).detach();
+                return;
             }
         }
 
-        if (!becameReady) return;
+        log::info(
+            "P2PManager: protocol handshake complete for player {}; releasing {} pending messages",
+            pid,
+            pending.size()
+        );
+
+        if (m_role == Role::Host && pid > 0) {
+            auto settings = getRoomSettings();
+            auto roomPacket = proto::serializeRoomSettingsChanged(
+                settings.maxPlayers, settings.allowBuild, settings.allowDelete, settings.allowWorkshop,
+                settings.allowLevelSettings, settings.autoRepair, settings.locked
+            );
+            sendTo(pid, roomPacket, ChannelType::Reliable);
+        }
 
         for (auto& msg : pending) {
             sendTo(pid, msg.data, msg.channel);
@@ -809,7 +1551,13 @@ namespace mpedit {
 
         if (m_role == Role::Client && pid == 0) {
             m_state.store(State::Connected);
+            m_reconnectAttempts = 0;
+            m_reconnectScheduled.store(false);
             stopSignalPolling();
+
+            auto syncRequest = proto::serializeInitialSyncRequest();
+            sendTo(0, syncRequest, ChannelType::Reliable);
+            log::info("P2PManager: requested authoritative initial sync from host");
         }
 
         queueInMainThread([this, pid, name, colorIdx]() {
@@ -831,6 +1579,76 @@ namespace mpedit {
         });
     }
 
+    void P2PManager::checkPeerReady(int playerId) {
+        bool becameTransportReady = false;
+        int pid = -1;
+        std::string name;
+
+        {
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(playerId);
+            if (it == m_peers.end()) return;
+
+            auto& peer = it->second;
+            bool reliableOpen = peer.reliable && peer.reliable->isOpen();
+            bool unreliableOpen = peer.unreliable && peer.unreliable->isOpen();
+
+            if (reliableOpen && unreliableOpen && !peer.ready) {
+                peer.ready = true;
+                pid = peer.playerId;
+                name = peer.playerName;
+                becameTransportReady = true;
+                log::info(
+                    "P2PManager: transport ready for player {} ({}); waiting for protocol handshake",
+                    pid,
+                    name
+                );
+            }
+        }
+
+        if (!becameTransportReady) return;
+
+        auto hello = proto::serializeProtocolHello(kProtocolVersion);
+        sendTo(pid, hello, ChannelType::Reliable);
+    }
+
+
+
+
+    void P2PManager::scheduleClientReconnect() {
+        if (m_role != Role::Client) return;
+        if (m_reconnectScheduled.exchange(true)) return;
+
+        constexpr int kMaxReconnectAttempts = 6;
+        if (m_reconnectAttempts >= kMaxReconnectAttempts) {
+            m_reconnectScheduled.store(false);
+            m_state.store(State::Error);
+            for (auto& cb : m_onError) cb("Reconnect failed");
+            return;
+        }
+
+        int attempt = ++m_reconnectAttempts;
+        int delayMs = std::min(5000, 500 * (1 << std::min(attempt - 1, 3)));
+        auto room = getRoomCode();
+        auto name = m_localPlayerName;
+
+        log::warn(
+            "P2PManager: scheduling reconnect attempt {} in {} ms",
+            attempt,
+            delayMs
+        );
+
+        std::thread([this, delayMs, room, name]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            queueInMainThread([this, room, name]() {
+                m_reconnectScheduled.store(false);
+                if (m_role != Role::Client || m_state.load() != State::Reconnecting) return;
+                stopSignalPolling();
+                log::info("P2PManager: reconnecting to room {}", room);
+                signalingJoinRoom(room, name);
+            });
+        }).detach();
+    }
 
 
     void P2PManager::leaveSession() {
@@ -869,9 +1687,16 @@ namespace mpedit {
 
         m_state.store(State::Disconnected);
         m_nextPlayerId = 1;
+        m_reconnectAttempts = 0;
+        m_reconnectScheduled.store(false);
+        m_recentDisconnectedNames.clear();
+        m_kickedNames.clear();
+        m_globalRevision.store(0);
+        m_lastGlobalAuthor.store(0);
         m_signalingRoomId.clear();
 
         log::info("P2PManager: Session ended");
     }
 
 } // namespace mpedit
+

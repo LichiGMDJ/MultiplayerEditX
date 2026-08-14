@@ -40,6 +40,8 @@ namespace mpedit {
     }
 
     void SessionStatusNode::update(float dt) {
+        if (!this->isRunning() || !m_statusLabel) return;
+
         auto& session = SessionManager::get();
         auto& net = P2PManager::get();
 

@@ -42,46 +42,79 @@ jobs:
           from pathlib import Path
 
           mod = json.loads(Path("mod.json").read_text(encoding="utf-8"))
+          assert mod["geode"] == "5.9.0"
           assert mod["id"] == "lichigmdj.multiplayereditx"
           assert mod["version"] == "0.5.3"
+          assert mod["settings"]["connection-mode"]["one-of"] == [
+              "Auto", "WebRTC", "TURN", "HTTP Relay"
+          ]
 
           p2p = Path("src/P2PManager.cpp").read_text(encoding="utf-8")
+          p2ph = Path("src/P2PManager.hpp").read_text(encoding="utf-8")
           hooks = Path("src/EditorHooks.cpp").read_text(encoding="utf-8")
           remote = Path("src/RemoteActionHandler.cpp").read_text(encoding="utf-8")
           capabilities = Path("src/net/ProtocolCapabilities.hpp").read_text(encoding="utf-8")
+          network = Path("src/net/NetworkConfig.hpp").read_text(encoding="utf-8")
           adaptive = Path("src/sync/AdaptiveSyncPolicy.hpp").read_text(encoding="utf-8")
           signaling = Path("server/signaling/server.ts").read_text(encoding="utf-8")
 
+          # Protocol and transport architecture.
           assert "kCurrentProtocol = 8" in capabilities
-          assert "HostMigration" in capabilities
-          assert "AdaptiveSync" in capabilities
-          assert "SecureSignaling" in capabilities
-          assert "serializeProtocolHello(net::kCurrentProtocol" in p2p
+          for token in [
+              "ReliableAcks", "EditorLayers", "RawBulkPaste", "RoomSettings",
+              "GlobalRevision", "TargetedRepair", "AdaptiveSync", "HostMigration",
+              "SecureSignaling",
+          ]:
+              assert token in capabilities
+          for token in [
+              "ConnectionMode::Auto", "ConnectionMode::WebRTC",
+              "ConnectionMode::Turn", "ConnectionMode::HttpRelay",
+          ]:
+              assert token in network
+          assert "stable 0.5.0 WebRTC direct/STUN" in p2p
+          assert "httpRelayPostInFlight" in p2ph
+          assert "isOrderedReliableOpcode" in p2p
+          assert "HTTP relay accepted reliable sequence" in p2p
+          assert "checkPeerReady(fromId);" in p2p
+          assert "checkPeerReady(playerId);" in p2p
+          assert "signaling POST {} failed" in p2p
           assert "requestHostMigration" in p2p
-          assert "AdaptiveSyncPolicy" in hooks
-          assert "SYNC PERF" in hooks
-          assert "encodeLayerTaggedUuid" in hooks
-          assert "decodeLayerTaggedUuid" in remote
-          assert "applyEditorLayers(match, tagged.layer1, tagged.layer2)" in remote
+
+          # Level/object synchronization must survive networking refactors.
+          for token in [
+              "s_startPosObjects", "s_startPosSaveStrings", "m_objectID == 31",
+              "encodeLayerTaggedUuid", "objectLayerSyncState",
+              "serializeSyncLevelStart", "serializeSyncLevelChunk", "serializeSyncLevelEnd",
+              "serializeBulkPasteStart", "serializeBulkPasteChunk", "serializeBulkPasteEnd",
+              "serializePlaceObjects", "serializeDeleteObjects", "serializeMoveObjects",
+              "serializeUpdateObjects", "serializeReconcileObjects", "AdaptiveSyncPolicy",
+              "SYNC PERF",
+          ]:
+              assert token in hooks, token
+          for token in [
+              "decodeLayerTaggedUuid", "applyEditorLayers", "applyPendingSync",
+              "InitialSyncRequest",
+          ]:
+              assert token in remote, token
+
+          # Signaling v2 + selectable HTTP relay transport.
           assert "sessionToken" in signaling
           assert 'parts[2] === "migrate"' in signaling
-          assert "194.226.126.115" not in p2p
-
-          # 0.5.3 connection stabilization invariants.
-          assert "remote ICE candidate from" in p2p
-          assert "skipping duplicate setLocalDescription" in p2p
-          assert "!cand.empty() && fromId >= 0" in p2p
+          assert "transportMode" in signaling
+          assert "RELAY_LONG_POLL_MS = 20_000" in signaling
+          assert '["webrtc", "turn", "http-relay-v1"]' in signaling
           assert "sdpMid can legitimately be empty" in signaling
           assert "!candidate || !mid" not in signaling
+          assert "194.226.126.115" not in p2p
 
-          print("v0.5.3 architecture and ICE stabilization verification passed")
+          print("v0.5.3 transport + synchronization architecture verification passed")
           PY
 
       - name: Build
         id: build
         uses: geode-sdk/build-geode-mod@main
         with:
-          sdk: 5.7.1
+          sdk: 5.9.0
           target: ${{ matrix.target }}
           build-config: Release
           android-min-sdk: 23

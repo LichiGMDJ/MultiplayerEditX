@@ -63,12 +63,6 @@
             "description": "Force WebRTC ICE through configured TURN for diagnostics or restrictive networks.",
             "default": false
         },
-        "http-relay-fallback": {
-            "type": "bool",
-            "name": "HTTP Relay Fallback",
-            "description": "Allow the client to fall back to the signaling server relay when direct WebRTC cannot connect.",
-            "default": true
-        },
         "player-name": {
             "type": "string",
             "name": "Player Name",

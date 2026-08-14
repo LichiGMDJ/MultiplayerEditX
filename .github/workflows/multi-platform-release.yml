@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - mod-id-lichigmdj
+      - main
     tags:
       - "v*"
   pull_request:
     branches:
-      - mod-id-lichigmdj
+      - main
 
 permissions:
   contents: write
@@ -66,7 +66,15 @@ jobs:
           assert "sessionToken" in signaling
           assert 'parts[2] === "migrate"' in signaling
           assert "194.226.126.115" not in p2p
-          print("v0.5.3 architecture verification passed")
+
+          # 0.5.3 connection stabilization invariants.
+          assert "remote ICE candidate from" in p2p
+          assert "skipping duplicate setLocalDescription" in p2p
+          assert "!cand.empty() && fromId >= 0" in p2p
+          assert "sdpMid can legitimately be empty" in signaling
+          assert "!candidate || !mid" not in signaling
+
+          print("v0.5.3 architecture and ICE stabilization verification passed")
           PY
 
       - name: Build

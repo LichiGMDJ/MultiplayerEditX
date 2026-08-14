@@ -407,8 +407,12 @@ async function handle(req: Request): Promise<Response> {
         if (!target) return json({ error: "target client not found" }, 404);
         enqueue(target, { ...message, generation: room.generation });
       } else {
-        const normalized = { ...message, playerId: sender.playerId, generation: room.generation };
-        delete normalized.targetPlayerId;
+        const { targetPlayerId: _ignoredTarget, ...forwarded } = message;
+        const normalized: SignalMessage = {
+          ...forwarded,
+          playerId: sender.playerId,
+          generation: room.generation,
+        };
         enqueue(room.host, normalized);
       }
 

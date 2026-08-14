@@ -109,11 +109,11 @@ namespace mpedit {
         bool relayOnly = network.forceTurnTransport() || forceRelay;
         if (relayOnly && customTurnAvailable) {
             config.iceTransportPolicy = rtc::TransportPolicy::Relay;
-            log::warn(
-                forceRelay && !network.forceTurnTransport()
-                    ? "P2PManager: stable WebRTC path failed; retrying through configured TURN/UDP"
-                    : "P2PManager: TURN relay transport selected"
-            );
+            if (forceRelay && !network.forceTurnTransport()) {
+                log::warn("P2PManager: stable WebRTC path failed; retrying through configured TURN/UDP");
+            } else {
+                log::warn("P2PManager: TURN relay transport selected");
+            }
         } else if (network.httpRelayImmediate()) {
             log::info("P2PManager: HTTP Relay transport selected; ICE will not be used");
         } else if (network.directWebRtcOnly()) {

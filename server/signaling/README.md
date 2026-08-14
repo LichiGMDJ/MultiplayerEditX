@@ -1,43 +1,34 @@
-# Signaling Server
+# Multiplayer Edit X signaling service
 
-WebRTC signaling server for MultiplayerEdit. Facilitates SDP offer/answer and ICE candidate exchange so peers can establish direct P2P connections.
+Production signaling API for Multiplayer Edit X 0.5.3+.
 
-## What This Does
+## Design
 
-- **Only signaling:** This server helps players find each other and exchange connection info. Once a WebRTC connection is established, all game data flows directly between players. The server never sees or relays game data.
-- Room-based matchmaking with 6-character room codes
-- Supports up to 8 players per room
-- Rooms auto-expire after 2 hours
+- Long-poll HTTP signaling for SDP/ICE exchange.
+- Bearer `sessionToken` authentication after room create/join.
+- Cryptographically random room/session identifiers.
+- Room inactivity TTL and bounded per-player signal queues.
+- Per-IP create/join rate limiting.
+- Request, SDP and ICE-candidate size limits.
+- Server-assisted host migration while keeping the same room code.
+- The service never relays editor/game data; WebRTC or TURN carries peer traffic.
 
-## Deploy to Deno Deploy
+The production server binds to `127.0.0.1:8000` and is intended to run behind nginx TLS.
 
-1. Go to [dash.deno.com](https://dash.deno.com) and sign in
-2. Create a new project
-3. Link to this repo and set the entrypoint to `server/signaling/worker.js`
-4. Deploy — that's it
+## Run
 
-Your server URL will be something like `https://your-project.deno.dev`.
-
-## Run Locally
-
-```bash
-deno run --allow-net worker.js
+```sh
+deno run --allow-net server.ts
 ```
 
-Server starts on `http://localhost:8000`.
+## Main endpoints
 
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/rooms` | Create room. Body: `{playerName}` |
-| GET | `/rooms/:code` | Get room info |
-| POST | `/rooms/:code/join` | Join room. Body: `{playerName}` |
-| POST | `/rooms/:code/offer` | Send SDP offer. Body: `{sdp, targetPlayerId}` |
-| GET | `/rooms/:code/offer?playerId=N` | Poll for SDP offer |
-| POST | `/rooms/:code/answer` | Send SDP answer. Body: `{sdp, playerId}` |
-| GET | `/rooms/:code/answer?playerId=N` | Poll for SDP answer |
-| POST | `/rooms/:code/ice` | Send ICE candidates. Body: `{playerId, candidates[], isHost}` |
-| GET | `/rooms/:code/ice?playerId=N&isHost=bool` | Poll for ICE candidates |
-| DELETE | `/rooms/:code` | Close room |
-| GET | `/health` | Health check |
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/rooms` | Create a room and host session token |
+| POST | `/rooms/:code/join` | Join and receive a client session token |
+| GET | `/rooms/:code/signal` | Authenticated long poll |
+| POST | `/rooms/:code/signal` | Authenticated SDP/ICE delivery |
+| POST | `/rooms/:code/migrate` | Resolve/promote the next host after host loss |
+| DELETE | `/rooms/:code` | Host leaves; migrates if clients remain, closes otherwise |
+| GET | `/` | Health/status response |

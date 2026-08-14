@@ -34,6 +34,36 @@ namespace mpedit {
                 opcode == proto::Opcode::BulkPasteEnd;
         }
 
+        bool isOrderedReliableOpcode(uint8_t raw) {
+            auto opcode = static_cast<proto::Opcode>(raw);
+            return
+                opcode == proto::Opcode::PlaceObjects ||
+                opcode == proto::Opcode::DeleteObjects ||
+                opcode == proto::Opcode::MoveObjects ||
+                opcode == proto::Opcode::MoveBatch ||
+                opcode == proto::Opcode::TransformObjects ||
+                opcode == proto::Opcode::ReconcileObjects ||
+                opcode == proto::Opcode::UpdateObjects ||
+                opcode == proto::Opcode::LockObjects ||
+                opcode == proto::Opcode::UpdateSettings ||
+                opcode == proto::Opcode::SyncLevelStart ||
+                opcode == proto::Opcode::SyncLevelChunk ||
+                opcode == proto::Opcode::SyncLevelEnd ||
+                opcode == proto::Opcode::LevelDigest ||
+                opcode == proto::Opcode::LevelManifest ||
+                opcode == proto::Opcode::LevelRepairRequest ||
+                opcode == proto::Opcode::FullResyncRequest ||
+                opcode == proto::Opcode::BulkPasteStart ||
+                opcode == proto::Opcode::BulkPasteChunk ||
+                opcode == proto::Opcode::BulkPasteEnd ||
+                opcode == proto::Opcode::GlobalRevision ||
+                opcode == proto::Opcode::SharedDigest ||
+                opcode == proto::Opcode::GlobalSnapshotRequest ||
+                opcode == proto::Opcode::KickPlayer ||
+                opcode == proto::Opcode::MusicChanged ||
+                opcode == proto::Opcode::RoomSettingsChanged;
+        }
+
         std::string bytesToHex(std::vector<uint8_t> const& data) {
             static constexpr char kHex[] = "0123456789abcdef";
             std::string out;
@@ -360,193 +390,166 @@ namespace mpedit {
             peer.pendingMessages.push_back({data, channel});
             return;
         }
+
+        constexpr size_t kSafeMessageBytes = 24 * 1024;
+
+        auto queueTrackedReliable = [&](std::vector<uint8_t> const& payload) -> bool {
+            constexpr size_t kMaxTrackedReliable = 8192;
+            if (peer.pendingReliableAcks.size() >= kMaxTrackedReliable) {
+                log::error(
+                    "P2PManager: tracked reliable window full for player {}; opcode {} rejected",
+                    playerId,
+                    payload.empty() ? -1 : static_cast<int>(payload[0])
+                );
+                return false;
+            }
+
+            uint32_t sequence = peer.nextReliableSequence++;
+            if (sequence == 0) sequence = peer.nextReliableSequence++;
+            auto envelope = proto::serializeReliableEnvelope(sequence, payload);
+            peer.pendingReliableAcks[sequence] = PeerInfo::PendingAck {
+                envelope, 0, 0, true
+            };
+            peer.bulkReliableQueue.push_back(std::move(envelope));
+            log::debug(
+                "P2PManager: TX queued #{} opcode={} player={} transport={}",
+                sequence,
+                payload.empty() ? -1 : static_cast<int>(payload[0]),
+                playerId,
+                peer.httpRelay ? "http-relay" : "webrtc"
+            );
+            return true;
+        };
+
+        // Ordered editor traffic always enters the same sequence/ACK pipeline,
+        // regardless of whether the physical transport is SCTP or HTTP Relay.
+        // This is critical for initial level chunks, start positions and bulk edits.
+        if (
+            channel == ChannelType::Reliable &&
+            !data.empty() &&
+            data.size() <= kSafeMessageBytes &&
+            isOrderedReliableOpcode(data[0])
+        ) {
+            constexpr size_t kMaxOrderedReliableQueue = 8192;
+            if (peer.bulkReliableQueue.size() < kMaxOrderedReliableQueue) {
+                queueTrackedReliable(data);
+            } else {
+                log::error(
+                    "P2PManager: ordered reliable queue full for player {}; opcode {} could not be retained",
+                    playerId,
+                    static_cast<int>(data[0])
+                );
+            }
+            return;
+        }
+
+        if (
+            channel == ChannelType::Reliable &&
+            !data.empty() &&
+            data.size() > kSafeMessageBytes &&
+            data[0] == static_cast<uint8_t>(proto::Opcode::PlaceObjects)
+        ) {
+            proto::Reader reader(data.data() + 1, data.size() - 1);
+            auto msg = proto::deserializePlaceObjects(reader);
+            if (reader.hasError()) {
+                log::warn("P2PManager: refusing to split malformed PlaceObjects payload");
+                return;
+            }
+
+            std::vector<ActionSerializer::ObjectData> batch;
+            batch.reserve(64);
+            size_t sentObjects = 0;
+
+            auto flushBatch = [&]() -> bool {
+                if (batch.empty()) return true;
+                auto payload = proto::serializePlaceObjects(batch);
+                if (payload.size() > kSafeMessageBytes) {
+                    log::warn(
+                        "P2PManager: dropping oversized PlaceObjects sub-batch ({} objects, {} bytes)",
+                        batch.size(), payload.size()
+                    );
+                    batch.clear();
+                    return false;
+                }
+                queueTrackedReliable(payload);
+                sentObjects += batch.size();
+                batch.clear();
+                return true;
+            };
+
+            for (auto const& object : msg.objects) {
+                batch.push_back(object);
+                auto probe = proto::serializePlaceObjects(batch);
+                if (probe.size() > kSafeMessageBytes) {
+                    auto last = std::move(batch.back());
+                    batch.pop_back();
+                    flushBatch();
+                    batch.push_back(std::move(last));
+                    auto single = proto::serializePlaceObjects(batch);
+                    if (single.size() > kSafeMessageBytes) {
+                        log::warn(
+                            "P2PManager: one object is too large to synchronize safely ({} bytes); skipping it",
+                            single.size()
+                        );
+                        batch.clear();
+                    }
+                }
+            }
+            flushBatch();
+
+            log::info(
+                "P2PManager: queued oversized PlaceObjects payload: {} objects in {} paced reliable messages",
+                sentObjects,
+                peer.bulkReliableQueue.size()
+            );
+            return;
+        }
+
         if (peer.httpRelay) {
+            if (data.size() > 48 * 1024) {
+                log::warn(
+                    "P2PManager: dropping oversized HTTP relay message (opcode={}, {} bytes)",
+                    data.empty() ? -1 : static_cast<int>(data[0]), data.size()
+                );
+                return;
+            }
             sendHttpRelayPacket(playerId, data, channel);
             return;
         }
 
         auto& dc = (channel == ChannelType::Reliable) ? peer.reliable : peer.unreliable;
+        if (!dc || !dc->isOpen()) return;
 
-        if (dc && dc->isOpen()) {
-            constexpr size_t kSafeMessageBytes = 24 * 1024;
-
-            auto queueTrackedReliable = [&](std::vector<uint8_t> const& payload) -> bool {
-                constexpr size_t kMaxTrackedReliable = 8192;
-                if (peer.pendingReliableAcks.size() >= kMaxTrackedReliable) {
-                    log::error(
-                        "P2PManager: tracked reliable window full for player {}; opcode {} rejected",
-                        playerId,
-                        payload.empty() ? -1 : static_cast<int>(payload[0])
-                    );
-                    return false;
-                }
-
-                uint32_t sequence = peer.nextReliableSequence++;
-                if (sequence == 0) sequence = peer.nextReliableSequence++;
-                auto envelope = proto::serializeReliableEnvelope(sequence, payload);
-                peer.pendingReliableAcks[sequence] = PeerInfo::PendingAck {
-                    envelope, 0, 0, true
-                };
-                peer.bulkReliableQueue.push_back(std::move(envelope));
-                log::debug(
-                    "P2PManager: TX queued #{} opcode={} player={}",
-                    sequence,
-                    payload.empty() ? -1 : static_cast<int>(payload[0]),
-                    playerId
-                );
+        auto sendRaw = [&](std::vector<uint8_t> const& payload) -> bool {
+            try {
+                dc->send(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
                 return true;
-            };
-
-            auto sendRaw = [&](std::vector<uint8_t> const& payload) -> bool {
-                try {
-                    dc->send(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
-                    return true;
-                } catch (std::exception const& e) {
-                    log::error(
-                        "P2PManager: data-channel send failed for player {} ({} bytes): {}",
-                        playerId,
-                        payload.size(),
-                        e.what()
-                    );
-                    return false;
-                } catch (...) {
-                    log::error(
-                        "P2PManager: data-channel send failed for player {} ({} bytes): unknown exception",
-                        playerId,
-                        payload.size()
-                    );
-                    return false;
-                }
-            };
-
-            if (data.size() <= kSafeMessageBytes) {
-                if (channel == ChannelType::Reliable && !data.empty()) {
-                    auto opcode = static_cast<proto::Opcode>(data[0]);
-                    bool orderedEditorTraffic =
-                        opcode == proto::Opcode::PlaceObjects ||
-                        opcode == proto::Opcode::DeleteObjects ||
-                        opcode == proto::Opcode::MoveObjects ||
-                        opcode == proto::Opcode::MoveBatch ||
-                        opcode == proto::Opcode::TransformObjects ||
-                        opcode == proto::Opcode::ReconcileObjects ||
-                        opcode == proto::Opcode::UpdateObjects ||
-                        opcode == proto::Opcode::LockObjects ||
-                        opcode == proto::Opcode::UpdateSettings ||
-                        opcode == proto::Opcode::SyncLevelStart ||
-                        opcode == proto::Opcode::SyncLevelChunk ||
-                        opcode == proto::Opcode::SyncLevelEnd ||
-                        opcode == proto::Opcode::LevelDigest ||
-                        opcode == proto::Opcode::LevelManifest ||
-                        opcode == proto::Opcode::LevelRepairRequest ||
-                        opcode == proto::Opcode::FullResyncRequest ||
-                        opcode == proto::Opcode::BulkPasteStart ||
-                        opcode == proto::Opcode::BulkPasteChunk ||
-                        opcode == proto::Opcode::BulkPasteEnd ||
-                        opcode == proto::Opcode::GlobalRevision ||
-                        opcode == proto::Opcode::SharedDigest ||
-                        opcode == proto::Opcode::GlobalSnapshotRequest ||
-                        opcode == proto::Opcode::KickPlayer ||
-                        opcode == proto::Opcode::MusicChanged ||
-                        opcode == proto::Opcode::RoomSettingsChanged;
-
-                    if (orderedEditorTraffic) {
-                        constexpr size_t kMaxOrderedReliableQueue = 8192;
-                        if (peer.bulkReliableQueue.size() < kMaxOrderedReliableQueue) {
-                            queueTrackedReliable(data);
-                            log::debug(
-                                "P2PManager: queued reliable editor opcode {} for ordered ACK delivery to player {} (queue={})",
-                                static_cast<int>(data[0]),
-                                playerId,
-                                peer.bulkReliableQueue.size()
-                            );
-                        } else {
-                            log::error(
-                                "P2PManager: ordered reliable queue full for player {}; opcode {} could not be retained",
-                                playerId,
-                                static_cast<int>(data[0])
-                            );
-                        }
-                        return;
-                    }
-                }
-
-                // Handshake/session-control traffic and unreliable cursor state
-                // remain immediate. They are low-volume and must work before an
-                // editor network tick exists.
-                sendRaw(data);
-                return;
-            }
-
-            if (
-                channel == ChannelType::Reliable &&
-                !data.empty() &&
-                data[0] == static_cast<uint8_t>(proto::Opcode::PlaceObjects)
-            ) {
-                proto::Reader reader(data.data() + 1, data.size() - 1);
-                auto msg = proto::deserializePlaceObjects(reader);
-                if (reader.hasError()) {
-                    log::warn("P2PManager: refusing to split malformed PlaceObjects payload");
-                    return;
-                }
-
-                std::vector<ActionSerializer::ObjectData> batch;
-                batch.reserve(64);
-                size_t sentObjects = 0;
-
-                auto flushBatch = [&]() -> bool {
-                    if (batch.empty()) return true;
-                    auto payload = proto::serializePlaceObjects(batch);
-                    if (payload.size() > kSafeMessageBytes) {
-                        log::warn(
-                            "P2PManager: dropping oversized PlaceObjects sub-batch ({} objects, {} bytes)",
-                            batch.size(),
-                            payload.size()
-                        );
-                        batch.clear();
-                        return false;
-                    }
-
-                    queueTrackedReliable(payload);
-                    sentObjects += batch.size();
-                    batch.clear();
-                    return true;
-                };
-
-                for (auto const& object : msg.objects) {
-                    batch.push_back(object);
-                    auto probe = proto::serializePlaceObjects(batch);
-                    if (probe.size() > kSafeMessageBytes) {
-                        auto last = std::move(batch.back());
-                        batch.pop_back();
-                        flushBatch();
-
-                        batch.push_back(std::move(last));
-                        auto single = proto::serializePlaceObjects(batch);
-                        if (single.size() > kSafeMessageBytes) {
-                            log::warn(
-                                "P2PManager: one object is too large to synchronize safely ({} bytes); skipping it",
-                                single.size()
-                            );
-                            batch.clear();
-                        }
-                    }
-                }
-                flushBatch();
-
-                log::info(
-                    "P2PManager: queued oversized PlaceObjects payload: {} objects in {} paced SCTP messages",
-                    sentObjects,
-                    peer.bulkReliableQueue.size()
+            } catch (std::exception const& e) {
+                log::error(
+                    "P2PManager: data-channel send failed for player {} ({} bytes): {}",
+                    playerId, payload.size(), e.what()
                 );
-                return;
+                return false;
+            } catch (...) {
+                log::error(
+                    "P2PManager: data-channel send failed for player {} ({} bytes): unknown exception",
+                    playerId, payload.size()
+                );
+                return false;
             }
+        };
 
-            log::warn(
-                "P2PManager: dropping oversized unsupported message (opcode={}, {} bytes)",
-                data.empty() ? -1 : static_cast<int>(data[0]),
-                data.size()
-            );
+        if (data.size() <= kSafeMessageBytes) {
+            // Handshake/session-control traffic and unreliable cursor state stay
+            // immediate. Ordered editor traffic was queued above.
+            sendRaw(data);
+            return;
         }
+
+        log::warn(
+            "P2PManager: dropping oversized unsupported message (opcode={}, {} bytes)",
+            data.empty() ? -1 : static_cast<int>(data[0]), data.size()
+        );
     }
 
     void P2PManager::broadcast(std::vector<uint8_t> const& data, ChannelType channel, int excludePlayerId) {
@@ -574,19 +577,50 @@ namespace mpedit {
 
         std::lock_guard lock(m_peersMutex);
         for (auto& [playerId, peer] : m_peers) {
-            if (!peer.ready || !peer.reliable || !peer.reliable->isOpen()) continue;
+            if (!peer.ready) continue;
+
+            bool webRtcReliableOpen = peer.reliable && peer.reliable->isOpen();
+            if (!peer.httpRelay && !webRtcReliableOpen) continue;
 
             for (auto& [sequence, pending] : peer.pendingReliableAcks) {
                 if (!pending.queued && pending.lastSentMs > 0 && now - pending.lastSentMs >= kAckTimeoutMs) {
                     peer.bulkReliableQueue.push_back(pending.envelope);
                     pending.queued = true;
                     log::warn(
-                        "P2PManager: RETRY #{} player={} attempt={}",
-                        sequence,
-                        playerId,
-                        pending.attempts + 1
+                        "P2PManager: RETRY #{} player={} attempt={} transport={}",
+                        sequence, playerId, pending.attempts + 1,
+                        peer.httpRelay ? "http-relay" : "webrtc"
                     );
                 }
+            }
+
+            if (peer.httpRelay) {
+                // Preserve HTTP application ordering: never issue the next
+                // reliable editor POST until the previous POST was accepted by
+                // the relay server. ACK then provides end-to-end delivery.
+                if (peer.httpRelayPostInFlight || peer.bulkReliableQueue.empty()) continue;
+
+                auto payload = peer.bulkReliableQueue.front();
+                peer.bulkReliableQueue.erase(peer.bulkReliableQueue.begin());
+
+                uint32_t trackedSequence = 0;
+                if (!payload.empty() && payload[0] == static_cast<uint8_t>(proto::Opcode::ReliableEnvelope)) {
+                    proto::Reader sentReader(payload.data() + 1, payload.size() - 1);
+                    auto sentEnvelope = proto::deserializeReliableEnvelope(sentReader);
+                    if (!sentReader.hasError()) {
+                        trackedSequence = sentEnvelope.sequence;
+                        auto pendingIt = peer.pendingReliableAcks.find(trackedSequence);
+                        if (pendingIt != peer.pendingReliableAcks.end()) {
+                            pendingIt->second.lastSentMs = now;
+                            pendingIt->second.attempts += 1;
+                            pendingIt->second.queued = false;
+                        }
+                    }
+                }
+
+                peer.httpRelayPostInFlight = true;
+                sendHttpRelayPacket(playerId, payload, ChannelType::Reliable, trackedSequence);
+                continue;
             }
 
             size_t sentThisTick = 0;
@@ -614,19 +648,15 @@ namespace mpedit {
                     peer.bulkReliableQueue.erase(peer.bulkReliableQueue.begin());
                     ++sentThisTick;
                 } catch (std::exception const& e) {
-                    // Keep the packet at the front and retry on a later network tick.
                     log::warn(
                         "P2PManager: reliable FIFO send deferred for player {} ({} bytes): {}",
-                        playerId,
-                        payload.size(),
-                        e.what()
+                        playerId, payload.size(), e.what()
                     );
                     break;
                 } catch (...) {
                     log::warn(
                         "P2PManager: reliable FIFO send deferred for player {} ({} bytes): unknown exception",
-                        playerId,
-                        payload.size()
+                        playerId, payload.size()
                     );
                     break;
                 }
@@ -1964,11 +1994,28 @@ namespace mpedit {
         );
     }
 
-    void P2PManager::sendHttpRelayPacket(int playerId, std::vector<uint8_t> const& data, ChannelType channel) {
-        if (data.empty() || m_signalingToken.empty()) return;
+    void P2PManager::sendHttpRelayPacket(
+        int playerId,
+        std::vector<uint8_t> const& data,
+        ChannelType channel,
+        uint32_t trackedSequence
+    ) {
+        if (data.empty() || m_signalingToken.empty()) {
+            if (trackedSequence != 0) {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(playerId);
+                if (it != m_peers.end()) it->second.httpRelayPostInFlight = false;
+            }
+            return;
+        }
         constexpr size_t kMaxRelayPacketBytes = 48 * 1024;
         if (data.size() > kMaxRelayPacketBytes) {
             log::warn("P2PManager: HTTP relay packet too large ({} bytes)", data.size());
+            if (trackedSequence != 0) {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(playerId);
+                if (it != m_peers.end()) it->second.httpRelayPostInFlight = false;
+            }
             return;
         }
 
@@ -1984,11 +2031,36 @@ namespace mpedit {
         auto url = getSignalingUrl() + "/rooms/" + getRoomCode() + "/relay";
         async::spawn(
             req.post(url),
-            [playerId](web::WebResponse res) {
+            [this, playerId, trackedSequence](web::WebResponse res) {
+                if (trackedSequence != 0) {
+                    std::lock_guard lock(m_peersMutex);
+                    auto it = m_peers.find(playerId);
+                    if (it != m_peers.end()) {
+                        auto& peer = it->second;
+                        peer.httpRelayPostInFlight = false;
+                        if (!res.ok()) {
+                            auto pendingIt = peer.pendingReliableAcks.find(trackedSequence);
+                            if (pendingIt != peer.pendingReliableAcks.end() && !pendingIt->second.queued) {
+                                pendingIt->second.lastSentMs = 0;
+                                pendingIt->second.queued = true;
+                                peer.bulkReliableQueue.insert(
+                                    peer.bulkReliableQueue.begin(),
+                                    pendingIt->second.envelope
+                                );
+                            }
+                        }
+                    }
+                }
+
                 if (!res.ok()) {
                     log::warn(
-                        "P2PManager: HTTP relay POST to player {} failed code={} error={}",
-                        playerId, res.code(), res.errorMessage()
+                        "P2PManager: HTTP relay POST to player {} failed code={} error={} sequence={}",
+                        playerId, res.code(), res.errorMessage(), trackedSequence
+                    );
+                } else if (trackedSequence != 0) {
+                    log::debug(
+                        "P2PManager: HTTP relay accepted reliable sequence #{} for player {}",
+                        trackedSequence, playerId
                     );
                 }
             }

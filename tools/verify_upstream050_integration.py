@@ -20,6 +20,10 @@ for token in ['ConnectionMode::Auto', 'ConnectionMode::WebRTC', 'ConnectionMode:
 assert 'stable 0.5.0 WebRTC direct/STUN' in p2p
 assert 'checkPeerReady(fromId);' in p2p
 assert 'checkPeerReady(playerId);' in p2p
+assert 'httpRelayPostInFlight' in p2p
+assert 'isOrderedReliableOpcode' in p2p
+assert 'HTTP relay accepted reliable sequence' in p2p
+assert 'Preserve HTTP application ordering' in p2p
 assert 'HTTP relay long poll idle timeout; retrying' in p2p
 assert 'signaling POST {} failed' in p2p
 assert 'hostTransportMode' in p2p

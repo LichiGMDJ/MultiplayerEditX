@@ -163,6 +163,7 @@ namespace mpedit {
             bool reconnecting = false;
             bool connectionAnnounced = false;
             bool httpRelay = false;
+            bool httpRelayPostInFlight = false;
             std::vector<PendingCandidate> pendingCandidates;
         };
 
@@ -179,7 +180,12 @@ namespace mpedit {
         void startHttpRelayPolling(std::string const& code);
         void pollHttpRelayOnce(std::string const& code);
         void stopHttpRelayPolling();
-        void sendHttpRelayPacket(int playerId, std::vector<uint8_t> const& data, ChannelType channel);
+        void sendHttpRelayPacket(
+            int playerId,
+            std::vector<uint8_t> const& data,
+            ChannelType channel,
+            uint32_t trackedSequence = 0
+        );
         void handleHttpRelayMessages(matjson::Value const& messages);
         void activateHttpRelayForPeer(int playerId);
         void scheduleHttpRelayFallback(int playerId);

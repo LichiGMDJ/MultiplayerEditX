@@ -6,11 +6,11 @@
         "mac": "2.2081",
         "ios": "2.2081"
     },
-    "id": "d050.multiplayeredit",
-    "name": "Multiplayer Edit",
-    "version": "0.5.0",
-    "developer": "d050",
-    "description": "Collaborate with friends in real-time level editing! Host a session and build together.",
+    "id": "lichigmdj.multiplayereditx",
+    "name": "Multiplayer Edit X",
+    "version": "0.5.3",
+    "developer": "LichiGMDJ",
+    "description": "Fork of Multiplayer Edit by xXoanon, rebased on the stable 0.5.0 editor/network lifecycle with configurable signaling and TURN connection options.",
     "tags": [
         "editor",
         "online",
@@ -20,13 +20,7 @@
         "content"
     ],
     "links": {
-        "community": "https://discord.com/users/499203269504008202",
-        "source": "https://github.com/xXoanon/MultiplayerEdit",
-        "homepage": "https://d050.vercel.app/"
-    },
-    "issues": {
-        "info": "Please report any bugs or crashes on the GitHub issues page.",
-        "url": "https://github.com/xXoanon/MultiplayerEdit/issues"
+        "source": "https://github.com/LichiGMDJ/MultiplayerEditX"
     },
     "settings": {
         "connection-section": {
@@ -36,10 +30,44 @@
         "signaling-url": {
             "type": "string",
             "name": "Signaling Server URL",
-            "description": "URL of the signaling server used for connection setup. Only change this if you're self-hosting your own signaling server.",
-            "default": "https://dewy-flea-9364.d050.deno.net",
+            "description": "URL of the signaling server used for connection setup.",
+            "default": "https://194.226.126.115:8443",
             "max-length": 150,
             "filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.?&=-_"
+        },
+        "turn-section": {
+            "type": "title",
+            "name": "TURN Relay"
+        },
+        "turn-host": {
+            "type": "string",
+            "name": "TURN Host",
+            "description": "Hostname or IPv4 address of the TURN server. Port 3478/UDP is used.",
+            "default": "194.226.126.115"
+        },
+        "turn-username": {
+            "type": "string",
+            "name": "TURN Username",
+            "description": "TURN long-term credential username.",
+            "default": "mpedit"
+        },
+        "turn-password": {
+            "type": "string",
+            "name": "TURN Password",
+            "description": "TURN password stored locally in Geode settings and never embedded in release builds.",
+            "default": ""
+        },
+        "force-turn-relay": {
+            "type": "bool",
+            "name": "Force TURN Relay",
+            "description": "Force WebRTC ICE through configured TURN for diagnostics or restrictive networks.",
+            "default": false
+        },
+        "http-relay-fallback": {
+            "type": "bool",
+            "name": "HTTP Relay Fallback",
+            "description": "Allow the client to fall back to the signaling server relay when direct WebRTC cannot connect.",
+            "default": true
         },
         "player-name": {
             "type": "string",

@@ -6,6 +6,19 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
         raise RuntimeError(f"missing pattern: {label}")
     return text.replace(old, new, 1)
 
+# Repair the two malformed multiline C++ literals created by the integration
+# patch. The broken Python string contains real newlines; the replacement writes
+# escaped \n sequences into the C++ source.
+path = Path("src/ui/MultiplayerPopup.cpp")
+text = path.read_text(encoding="utf-8")
+broken = 'fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());'
+fixed = r'fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());'
+count = text.count(broken)
+if count != 2:
+    raise RuntimeError(f"expected 2 malformed network error strings, got {count}")
+text = text.replace(broken, fixed)
+path.write_text(text, encoding="utf-8")
+
 # Make ctype usage explicit and close the browser before password entry.
 path = Path("src/ui/RoomDiscoveryPopups.cpp")
 text = path.read_text(encoding="utf-8")

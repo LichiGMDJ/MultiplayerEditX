@@ -18,7 +18,6 @@ type Room = {
   nextPlayerId: number;
   host: Participant;
   clients: Map<number, Participant>;
-  migratedFromHost: boolean;
 };
 
 type RateBucket = {
@@ -175,7 +174,6 @@ function electMigrationHost(room: Room): Participant | null {
 function promoteHost(room: Room, winner: Participant): void {
   room.clients.delete(winner.playerId);
   room.generation += 1;
-  room.migratedFromHost = true;
   room.host = {
     ...winner,
     playerId: 0,
@@ -247,7 +245,6 @@ async function handle(req: Request): Promise<Response> {
       nextPlayerId: 1,
       host,
       clients: new Map(),
-      migratedFromHost: false,
     };
     rooms.set(roomCode, room);
 
@@ -274,6 +271,17 @@ async function handle(req: Request): Promise<Response> {
 
       const body = await readJson(req);
       if (!body) return json({ error: "invalid request body" }, 400);
+
+      const previousToken = bearerToken(req);
+      const previous = findParticipant(room, previousToken);
+      if (previous && previous.token !== room.host.token) {
+        room.clients.delete(previous.playerId);
+      }
+
+      // Hard server-side safety cap. Room Settings may enforce a lower limit.
+      if (room.clients.size >= 31) {
+        return json({ error: "room capacity reached" }, 429);
+      }
 
       const playerId = room.nextPlayerId++;
       const current = now();
@@ -306,12 +314,30 @@ async function handle(req: Request): Promise<Response> {
     }
 
     if (req.method === "POST" && parts.length === 3 && parts[2] === "migrate") {
+      const migrationBody = await readJson(req);
+      if (!migrationBody) return json({ error: "invalid request body" }, 400);
       const token = bearerToken(req);
       const requester = findParticipant(room, token);
       if (!requester) return json({ error: "unauthorized" }, 401);
 
-      // If the requester is already the current host, migration has completed.
-      if (requester.token === room.host.token && requester.playerId === 0 && room.migratedFromHost) {
+      const requestedGeneration = Number(migrationBody.generation ?? room.generation);
+
+      // A request from an earlier generation is observing a migration that has
+      // already completed. Never elect twice for the same host failure.
+      if (Number.isFinite(requestedGeneration) && requestedGeneration < room.generation) {
+        touch(room, requester);
+        const isCurrentHost = requester.token === room.host.token;
+        return json({
+          role: isCurrentHost ? "host" : "client",
+          playerId: isCurrentHost ? 0 : requester.playerId,
+          sessionToken: isCurrentHost ? room.host.token : requester.token,
+          generation: room.generation,
+          retryAfterMs: isCurrentHost ? 0 : 350,
+        });
+      }
+
+      // The current host may query migration status after graceful promotion.
+      if (requester.token === room.host.token && requester.playerId === 0) {
         touch(room, requester);
         return json({
           role: "host",
@@ -321,29 +347,22 @@ async function handle(req: Request): Promise<Response> {
         });
       }
 
-      if (!room.migratedFromHost) {
-        const winner = electMigrationHost(room);
-        if (!winner) {
-          rooms.delete(roomCode);
-          return json({ error: "no migration candidate" }, 410);
-        }
-        promoteHost(room, winner);
+      // Exactly one request for the current generation performs the election.
+      const winner = electMigrationHost(room);
+      if (!winner) {
+        rooms.delete(roomCode);
+        return json({ error: "no migration candidate" }, 410);
       }
+      promoteHost(room, winner);
 
       const current = findParticipant(room, token);
-      if (current && current.token === room.host.token) {
-        return json({
-          role: "host",
-          playerId: 0,
-          sessionToken: room.host.token,
-          generation: room.generation,
-        });
-      }
-
+      const isCurrentHost = current?.token === room.host.token;
       return json({
-        role: "client",
+        role: isCurrentHost ? "host" : "client",
+        playerId: isCurrentHost ? 0 : current?.playerId,
+        sessionToken: isCurrentHost ? room.host.token : current?.token,
         generation: room.generation,
-        retryAfterMs: 350,
+        retryAfterMs: isCurrentHost ? 0 : 350,
       });
     }
 
@@ -374,7 +393,6 @@ async function handle(req: Request): Promise<Response> {
       const validationError = validateSignal(message);
       if (validationError) return json({ error: validationError }, 400);
 
-      const type = message.type as string;
       const isHost = sender.token === room.host.token;
 
       if (isHost) {

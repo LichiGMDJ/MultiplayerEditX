@@ -1193,6 +1193,9 @@ namespace mpedit {
 
         auto req = web::WebRequest();
         req.header("Content-Type", "application/json");
+        if (!m_signalingToken.empty()) {
+            req.header("Authorization", "Bearer " + m_signalingToken);
+        }
         auto body = matjson::Value();
         body["playerName"] = playerName;
         body["protocol"] = static_cast<int>(net::kCurrentProtocol);

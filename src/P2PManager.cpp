@@ -1631,6 +1631,20 @@ namespace mpedit {
                         scheduleHttpRelayFallback(0);
                     }
 
+                } else if (res.code() == 403) {
+                    if (m_state.load() == State::Reconnecting) {
+                        log::warn("P2PManager: reconnect join rejected with 403; stopping reconnect");
+                    }
+                    std::vector<ErrorCb> callbacks;
+                    std::string err;
+                    {
+                        std::lock_guard lock(m_stateMutex);
+                        m_error = "Invalid room password";
+                        m_state.store(State::Error);
+                        callbacks = m_onError;
+                        err = m_error;
+                    }
+                    for (auto& cb : callbacks) cb(err);
                 } else if (res.code() == 404) {
                     if (m_state.load() == State::Reconnecting) {
                         log::warn("P2PManager: reconnect join returned 404; retrying");

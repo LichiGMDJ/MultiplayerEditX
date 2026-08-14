@@ -377,9 +377,7 @@ namespace mpedit {
             auto& net = P2PManager::get();
             std::string fullError = error;
             if (net.getState() == P2PManager::State::Error) {
-                fullError = fmt::format("{}
-
-Network: {}", error, net.getError());
+                fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());
             }
             m_connectionPending = false;
             m_connectionElapsed = 0.f;
@@ -430,9 +428,7 @@ Network: {}", error, net.getError());
             auto& net = P2PManager::get();
             std::string fullError = error;
             if (net.getState() == P2PManager::State::Error) {
-                fullError = fmt::format("{}
-
-Network: {}", error, net.getError());
+                fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());
             }
             m_connectionPending = false;
             this->clearContentNode();

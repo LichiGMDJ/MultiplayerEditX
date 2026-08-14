@@ -6,6 +6,7 @@
 #include <Geode/ui/Notification.hpp>
 
 #include <algorithm>
+#include <cctype>
 
 using namespace geode::prelude;
 
@@ -374,7 +375,13 @@ void RoomBrowserPopup::onJoin(CCObject* sender) {
         return;
     }
     if (room.hasPassword) {
-        PasswordPopup::create(m_owner, room.roomCode, room.roomName)->show();
+        auto* owner = m_owner;
+        auto code = room.roomCode;
+        auto name = room.roomName;
+        this->onClose(nullptr);
+        if (auto* popup = PasswordPopup::create(owner, std::move(code), std::move(name))) {
+            popup->show();
+        }
     } else {
         this->onClose(nullptr);
         m_owner->beginJoin(room.roomCode, "");

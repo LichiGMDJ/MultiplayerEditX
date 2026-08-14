@@ -19,8 +19,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply migration
-        run: python3 tools/v053_upgrade.py
+      - name: Apply source-only migration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/v053_upgrade.py')
+          text = path.read_text(encoding='utf-8')
+          cut = text.index('wf_path = Path(".github/workflows/multi-platform-release.yml")')
+          path.write_text(text[:cut] + '\nprint("v0.5.3 source migration integrated")\n', encoding='utf-8')
+          PY
+          python3 tools/v053_upgrade.py
 
       - name: Validate source tree
         run: |
@@ -30,10 +38,10 @@ jobs:
           grep -q 'sessionToken' server/signaling/server.ts
           if grep -q '194.226.126.115' src/P2PManager.cpp; then exit 1; fi
 
-      - name: Commit
+      - name: Commit source only
         run: |
           git config user.name 'LichiGMDJ'
           git config user.email 'aleksandrrubacev222@gmail.com'
-          git add -A
+          git add src server CMakeLists.txt
           git commit -m 'Integrate v0.5.3 universal networking architecture'
           git push origin HEAD:mod-id-lichigmdj

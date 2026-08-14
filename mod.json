@@ -1,5 +1,5 @@
 {
-    "geode": "5.7.1",
+    "geode": "5.9.0",
     "gd": {
         "win": "2.2081",
         "android": "2.2081",
@@ -10,14 +10,17 @@
     "name": "Multiplayer Edit X",
     "version": "0.5.3",
     "developer": "LichiGMDJ",
-    "description": "Fork of Multiplayer Edit by xXoanon, extended with Android support, cross-platform multiplayer improvements, Room Settings, and networking reliability fixes.",
+    "description": "Fork of Multiplayer Edit by xXoanon, retaining the stable 0.5.0 editor/WebRTC lifecycle while extending synchronization, reliability, Room Settings, and selectable WebRTC/TURN/HTTP relay transports.",
     "links": {
         "source": "https://github.com/LichiGMDJ/MultiplayerEditX"
     },
     "tags": [
         "editor",
         "online",
-        "enhancement"
+        "enhancement",
+        "utility",
+        "interface",
+        "content"
     ],
     "settings": {
         "connection-section": {
@@ -30,6 +33,18 @@
             "description": "URL of the signaling server used for connection setup.",
             "default": "https://194.226.126.115:8443",
             "filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.?&=-_"
+        },
+        "connection-mode": {
+            "type": "string",
+            "name": "Connection Mode",
+            "description": "Auto prefers the stable direct/STUN WebRTC path, retries through configured TURN when available, then falls back to HTTP Relay. WebRTC disables relay fallback. TURN forces configured TURN/UDP. HTTP Relay connects through the signaling server immediately.",
+            "default": "Auto",
+            "one-of": [
+                "Auto",
+                "WebRTC",
+                "TURN",
+                "HTTP Relay"
+            ]
         },
         "turn-section": {
             "type": "title",

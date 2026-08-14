@@ -83,17 +83,22 @@ namespace mpedit {
 
     rtc::Configuration P2PManager::makeRtcConfig(bool forceRelay) {
         rtc::Configuration config;
-
-        // Prefer direct peer-to-peer connectivity. STUN exposes server-reflexive
-        // candidates and remains the cheapest/lowest-latency path when NAT allows it.
-        config.iceServers.push_back({"stun:stun.l.google.com:19302"});
-        config.iceServers.push_back({"stun:stun.cloudflare.com:3478"});
-
         auto network = net::NetworkConfig::load();
-        bool customTurnAvailable = network.hasTurn();
 
-        // User/self-hosted relay is preferred when configured.
-        if (customTurnAvailable) {
+        // Keep the proven upstream 0.5.0 direct/STUN path unchanged whenever
+        // WebRTC is enabled. Transport selection only layers policy on top.
+        if (!network.httpRelayImmediate()) {
+            config.iceServers.push_back({"stun:stun.l.google.com:19302"});
+            config.iceServers.push_back({"stun:stun.cloudflare.com:3478"});
+        }
+
+        bool customTurnAvailable = network.hasTurn();
+        bool allowConfiguredTurn =
+            network.connectionMode == net::ConnectionMode::Auto ||
+            network.connectionMode == net::ConnectionMode::Turn ||
+            network.forceTurnRelay || forceRelay;
+
+        if (customTurnAvailable && allowConfiguredTurn) {
             rtc::IceServer customTurn(
                 network.turnHost, 3478, network.turnUsername, network.turnPassword,
                 rtc::IceServer::RelayType::TurnUdp
@@ -101,21 +106,22 @@ namespace mpedit {
             config.iceServers.push_back(customTurn);
         }
 
-        if (network.forceTurnRelay || forceRelay) {
-            if (customTurnAvailable) {
-                config.iceTransportPolicy = rtc::TransportPolicy::Relay;
-                if (forceRelay && !network.forceTurnRelay) {
-                    log::warn("P2PManager: direct/STUN negotiation failed; retrying with configured TURN/UDP");
-                } else {
-                    log::warn("P2PManager: Force TURN diagnostic mode enabled");
-                }
-            } else {
-                log::warn("P2PManager: relay-only ICE requested but custom TURN is not configured; HTTP relay remains available");
-            }
+        bool relayOnly = network.forceTurnTransport() || forceRelay;
+        if (relayOnly && customTurnAvailable) {
+            config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+            log::warn(
+                forceRelay && !network.forceTurnTransport()
+                    ? "P2PManager: stable WebRTC path failed; retrying through configured TURN/UDP"
+                    : "P2PManager: TURN relay transport selected"
+            );
+        } else if (network.httpRelayImmediate()) {
+            log::info("P2PManager: HTTP Relay transport selected; ICE will not be used");
+        } else if (network.directWebRtcOnly()) {
+            log::info("P2PManager: stable 0.5.0 WebRTC direct/STUN transport selected");
         } else if (customTurnAvailable) {
-            log::info("P2PManager: ICE auto mode: direct/STUN preferred, custom TURN/UDP fallback available");
+            log::info("P2PManager: stable 0.5.0 WebRTC direct/STUN path with TURN/UDP fallback available");
         } else {
-            log::info("P2PManager: ICE direct/STUN mode; HTTP relay fallback available");
+            log::info("P2PManager: stable 0.5.0 WebRTC direct/STUN path; HTTP Relay fallback available");
         }
 
         return config;
@@ -992,6 +998,13 @@ namespace mpedit {
 
 
     void P2PManager::hostSession(std::string const& playerName) {
+        auto selectedNetwork = net::NetworkConfig::load();
+        if (selectedNetwork.connectionMode == net::ConnectionMode::Turn && !selectedNetwork.hasTurn()) {
+            m_state.store(State::Error);
+            m_error = "TURN mode requires TURN host, username and password";
+            for (auto& cb : m_onError) cb(m_error);
+            return;
+        }
         {
             std::lock_guard lock(m_stateMutex);
             m_role = Role::Host;
@@ -1022,6 +1035,7 @@ namespace mpedit {
         body["playerName"] = playerName;
         body["protocol"] = static_cast<int>(net::kCurrentProtocol);
         body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
+        body["transportMode"] = net::NetworkConfig::load().transportModeName();
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -1062,7 +1076,9 @@ namespace mpedit {
                     }
 
                     startSignalPolling(roomCode, "host", 0);
-                    startHttpRelayPolling(roomCode);
+                    if (net::NetworkConfig::load().allowsHttpRelayFallback()) {
+                        startHttpRelayPolling(roomCode);
+                    }
                 } else {
                     std::vector<ErrorCb> callbacks;
                     std::string err;
@@ -1142,7 +1158,17 @@ namespace mpedit {
             req.header("Authorization", "Bearer " + m_signalingToken);
         }
         req.bodyJSON(msg);
-        async::spawn(req.post(url));
+        async::spawn(
+            req.post(url),
+            [url](web::WebResponse res) {
+                if (!res.ok()) {
+                    log::warn(
+                        "P2PManager: signaling POST {} failed code={} error={}",
+                        url, res.code(), res.errorMessage()
+                    );
+                }
+            }
+        );
     }
 
     void P2PManager::handleSignalingMessages(matjson::Value const& messages) {
@@ -1159,9 +1185,30 @@ namespace mpedit {
                 int clientId = msg.get<int>("playerId").unwrapOr(-1);
                 auto clientName = msg.get<std::string>("playerName").unwrapOr("Player " + std::to_string(clientId));
                 if (clientId >= 0) {
-                    log::info("P2PManager: Client {} ({}) connecting via signal poll", clientId, clientName);
+                    auto clientTransport = msg.get<std::string>("transportMode").unwrapOr("auto");
+                    auto network = net::NetworkConfig::load();
+                    log::info(
+                        "P2PManager: Client {} ({}) connecting via signal poll (transport={})",
+                        clientId, clientName, clientTransport
+                    );
                     m_nextPlayerId = std::max(m_nextPlayerId, clientId + 1);
-                    createHostPeer(clientId, clientName);
+
+                    bool immediateHttpRelay =
+                        network.httpRelayImmediate() || clientTransport == "http-relay";
+                    if (immediateHttpRelay) {
+                        PeerInfo peer;
+                        peer.playerId = clientId;
+                        peer.playerName = clientName;
+                        peer.colorIndex = clientId % 6;
+                        {
+                            std::lock_guard lock(m_peersMutex);
+                            m_peers[clientId] = std::move(peer);
+                        }
+                        startHttpRelayPolling(getRoomCode());
+                        activateHttpRelayForPeer(clientId);
+                    } else {
+                        createHostPeer(clientId, clientName);
+                    }
                 }
             } else if (type == "answer") {
                 auto sdp = msg.get<std::string>("sdp").unwrapOr("");
@@ -1265,6 +1312,13 @@ namespace mpedit {
 
 
     void P2PManager::joinSession(std::string const& roomCode, std::string const& playerName) {
+        auto selectedNetwork = net::NetworkConfig::load();
+        if (selectedNetwork.connectionMode == net::ConnectionMode::Turn && !selectedNetwork.hasTurn()) {
+            m_state.store(State::Error);
+            m_error = "TURN mode requires TURN host, username and password";
+            for (auto& cb : m_onError) cb(m_error);
+            return;
+        }
         {
             std::lock_guard lock(m_stateMutex);
             m_role = Role::Client;
@@ -1293,6 +1347,7 @@ namespace mpedit {
         body["playerName"] = playerName;
         body["protocol"] = static_cast<int>(net::kCurrentProtocol);
         body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
+        body["transportMode"] = net::NetworkConfig::load().transportModeName();
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -1302,6 +1357,7 @@ namespace mpedit {
                     auto json = res.json().unwrapOr(matjson::Value());
                     m_localPlayerId = json.get<int>("playerId").unwrapOr(-1);
                     auto hostName = json.get<std::string>("hostName").unwrapOr("Host");
+                    auto hostTransportMode = json.get<std::string>("hostTransportMode").unwrapOr("auto");
                     m_signalingToken = json.get<std::string>("sessionToken").unwrapOr(m_signalingToken);
                     m_signalingGeneration = static_cast<uint32_t>(json.get<int>("generation").unwrapOr(static_cast<int>(m_signalingGeneration)));
                     m_signalingApi = static_cast<uint32_t>(json.get<int>("signalingApi").unwrapOr(static_cast<int>(m_signalingApi)));
@@ -1325,7 +1381,28 @@ namespace mpedit {
                         return;
                     }
 
-                    log::info("P2PManager: Joined room {} as player {}", roomCode, m_localPlayerId);
+                    log::info(
+                        "P2PManager: Joined room {} as player {} (host transport={})",
+                        roomCode, m_localPlayerId, hostTransportMode
+                    );
+
+                    auto network = net::NetworkConfig::load();
+                    bool immediateHttpRelay =
+                        network.httpRelayImmediate() || hostTransportMode == "http-relay";
+                    if (immediateHttpRelay) {
+                        PeerInfo hostPeer;
+                        hostPeer.playerId = 0;
+                        hostPeer.playerName = hostName;
+                        hostPeer.colorIndex = 0;
+                        {
+                            std::lock_guard lock(m_peersMutex);
+                            m_peers[0] = std::move(hostPeer);
+                        }
+                        startSignalPolling(roomCode, "client", m_localPlayerId);
+                        startHttpRelayPolling(roomCode);
+                        activateHttpRelayForPeer(0);
+                        return;
+                    }
 
                     bool relayRetry = m_forceRelayNextJoin.exchange(false);
                     auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig(relayRetry));
@@ -1465,7 +1542,10 @@ namespace mpedit {
                             }
 
                             auto network = net::NetworkConfig::load();
-                            if (!transportReady && !relayRetry && !network.forceTurnRelay && network.hasTurn()) {
+                            if (
+                                network.connectionMode == net::ConnectionMode::Auto &&
+                                !transportReady && !relayRetry && !network.forceTurnRelay && network.hasTurn()
+                            ) {
                                 log::warn("P2PManager: initial direct/STUN ICE failed; scheduling relay-only retry");
                                 {
                                     std::lock_guard lock(m_peersMutex);
@@ -1492,8 +1572,9 @@ namespace mpedit {
                     }
 
                     startSignalPolling(roomCode, "client", m_localPlayerId);
-                    startHttpRelayPolling(roomCode);
-                    scheduleHttpRelayFallback(0);
+                    if (network.connectionMode == net::ConnectionMode::Auto) {
+                        scheduleHttpRelayFallback(0);
+                    }
 
                 } else if (res.code() == 404) {
                     if (m_state.load() == State::Reconnecting) {
@@ -1841,7 +1922,8 @@ namespace mpedit {
 
 
     void P2PManager::startHttpRelayPolling(std::string const& code) {
-        m_httpRelayPollingActive.store(true);
+        if (m_httpRelayPollingActive.exchange(true)) return;
+        log::info("P2PManager: Starting HTTP relay long poll");
         pollHttpRelayOnce(code);
     }
 
@@ -1855,7 +1937,7 @@ namespace mpedit {
 
         auto req = web::WebRequest();
         req.header("Authorization", "Bearer " + m_signalingToken);
-        req.timeout(std::chrono::seconds(30));
+        req.timeout(std::chrono::seconds(35));
         auto url = getSignalingUrl() + "/rooms/" + code + "/relay";
 
         m_httpRelayPollListener.spawn(
@@ -1868,8 +1950,13 @@ namespace mpedit {
                     log::warn("P2PManager: HTTP relay poll stopped with {}", res.code());
                     m_httpRelayPollingActive.store(false);
                     return;
+                } else if (res.code() == -28) {
+                    log::debug("P2PManager: HTTP relay long poll idle timeout; retrying");
                 } else {
-                    log::warn("P2PManager: HTTP relay poll returned {}", res.code());
+                    log::warn(
+                        "P2PManager: HTTP relay poll returned {} error={}",
+                        res.code(), res.errorMessage()
+                    );
                 }
 
                 if (m_httpRelayPollingActive.load()) pollHttpRelayOnce(code);
@@ -1895,7 +1982,17 @@ namespace mpedit {
         req.header("Authorization", "Bearer " + m_signalingToken);
         req.bodyJSON(body);
         auto url = getSignalingUrl() + "/rooms/" + getRoomCode() + "/relay";
-        async::spawn(req.post(url));
+        async::spawn(
+            req.post(url),
+            [playerId](web::WebResponse res) {
+                if (!res.ok()) {
+                    log::warn(
+                        "P2PManager: HTTP relay POST to player {} failed code={} error={}",
+                        playerId, res.code(), res.errorMessage()
+                    );
+                }
+            }
+        );
     }
 
     void P2PManager::handleHttpRelayMessages(matjson::Value const& messages) {
@@ -1922,12 +2019,12 @@ namespace mpedit {
                 if (it == m_peers.end()) continue;
                 if (!it->second.httpRelay) {
                     it->second.httpRelay = true;
-                    it->second.ready = true;
                     newlyRelayed = true;
                 }
             }
             if (newlyRelayed) {
                 log::warn("P2PManager: peer {} switched to HTTP relay transport", fromId);
+                checkPeerReady(fromId);
             }
 
             onPeerMessage(fromId, payload.data(), payload.size());
@@ -1942,17 +2039,17 @@ namespace mpedit {
             if (it == m_peers.end()) return;
             if (it->second.connectionAnnounced || it->second.httpRelay) return;
             it->second.httpRelay = true;
-            it->second.ready = true;
             activate = true;
         }
         if (!activate) return;
 
-        log::warn("P2PManager: WebRTC not ready; activating HTTP relay transport for player {}", playerId);
-        auto hello = proto::serializeProtocolHello(net::kCurrentProtocol, net::kLocalCapabilities);
-        sendTo(playerId, hello, ChannelType::Reliable);
+        log::warn("P2PManager: activating HTTP relay transport for player {}", playerId);
+        startHttpRelayPolling(getRoomCode());
+        checkPeerReady(playerId);
     }
 
     void P2PManager::scheduleHttpRelayFallback(int playerId) {
+        if (net::NetworkConfig::load().connectionMode != net::ConnectionMode::Auto) return;
         std::thread([this, playerId]() {
             std::this_thread::sleep_for(std::chrono::seconds(8));
             queueInMainThread([this, playerId]() {

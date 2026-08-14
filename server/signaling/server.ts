@@ -14,6 +14,8 @@ type Participant = {
   lastSeenAt: number;
   queue: SignalMessage[];
   relayQueue: RelayMessage[];
+  transportMode: string;
+  relayActive: boolean;
 };
 
 type Room = {
@@ -35,6 +37,7 @@ type RateBucket = {
 const PORT = 8000;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const LONG_POLL_MS = 25_000;
+const RELAY_LONG_POLL_MS = 20_000;
 const MAX_QUEUE_MESSAGES = 128;
 const MAX_RELAY_QUEUE_MESSAGES = 512;
 const MAX_RELAY_PAYLOAD_HEX = 96 * 1024;
@@ -120,6 +123,13 @@ function sanitizePlayerName(value: unknown): string {
   return clean || "Player";
 }
 
+function sanitizeTransportMode(value: unknown): string {
+  if (typeof value !== "string") return "auto";
+  const normalized = value.trim().toLowerCase();
+  if (["auto", "webrtc", "turn", "http-relay"].includes(normalized)) return normalized;
+  return "auto";
+}
+
 function findParticipant(room: Room, token: string): Participant | null {
   if (!token) return null;
   if (room.host.token === token) return room.host;
@@ -150,7 +160,7 @@ function enqueueRelay(participant: Participant, message: RelayMessage): void {
 }
 
 async function longPollRelay(participant: Participant): Promise<Response> {
-  const deadline = now() + LONG_POLL_MS;
+  const deadline = now() + RELAY_LONG_POLL_MS;
   while (participant.relayQueue.length === 0 && now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -244,7 +254,7 @@ async function handle(req: Request): Promise<Response> {
       service: "Multiplayer Edit X signaling",
       apiVersion: 2,
       rooms: rooms.size,
-      transports: ["webrtc", "http-relay-v1"],
+      transports: ["webrtc", "turn", "http-relay-v1"],
     });
   }
 
@@ -269,6 +279,8 @@ async function handle(req: Request): Promise<Response> {
       lastSeenAt: current,
       queue: [],
       relayQueue: [],
+      transportMode: sanitizeTransportMode(body.transportMode),
+      relayActive: false,
     };
     const room: Room = {
       roomId: randomHex(16),
@@ -290,6 +302,7 @@ async function handle(req: Request): Promise<Response> {
       generation: room.generation,
       signalingApi: 2,
       relayApi: 1,
+      hostTransportMode: host.transportMode,
     }, 201);
   }
 
@@ -328,6 +341,8 @@ async function handle(req: Request): Promise<Response> {
         lastSeenAt: current,
         queue: [],
         relayQueue: [],
+        transportMode: sanitizeTransportMode(body.transportMode),
+        relayActive: false,
       };
       room.clients.set(playerId, participant);
       touch(room, participant);
@@ -336,6 +351,7 @@ async function handle(req: Request): Promise<Response> {
         type: "client_joined",
         playerId,
         playerName: participant.playerName,
+        transportMode: participant.transportMode,
         generation: room.generation,
       });
 
@@ -347,6 +363,7 @@ async function handle(req: Request): Promise<Response> {
         generation: room.generation,
         signalingApi: 2,
         relayApi: 1,
+        hostTransportMode: room.host.transportMode,
       });
     }
 
@@ -422,6 +439,11 @@ async function handle(req: Request): Promise<Response> {
       const channel = body.channel === "unreliable" ? "unreliable" : "reliable";
       if (!payload || payload.length > MAX_RELAY_PAYLOAD_HEX || (payload.length % 2) !== 0 || !/^[0-9a-fA-F]+$/.test(payload)) {
         return json({ error: "invalid relay payload" }, 400);
+      }
+
+      if (!sender.relayActive) {
+        sender.relayActive = true;
+        console.log(`[relay] room=${roomCode} player=${sender.playerId} transport=${sender.transportMode}`);
       }
 
       const isHost = sender.token === room.host.token;

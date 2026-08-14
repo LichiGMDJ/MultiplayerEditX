@@ -1,5 +1,11 @@
 type SignalMessage = Record<string, unknown>;
 
+type RelayMessage = {
+  fromPlayerId: number;
+  channel: "reliable" | "unreliable";
+  payload: string;
+};
+
 type Participant = {
   playerId: number;
   playerName: string;
@@ -7,6 +13,7 @@ type Participant = {
   joinedAt: number;
   lastSeenAt: number;
   queue: SignalMessage[];
+  relayQueue: RelayMessage[];
 };
 
 type Room = {
@@ -29,6 +36,8 @@ const PORT = 8000;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const LONG_POLL_MS = 25_000;
 const MAX_QUEUE_MESSAGES = 128;
+const MAX_RELAY_QUEUE_MESSAGES = 512;
+const MAX_RELAY_PAYLOAD_HEX = 96 * 1024;
 const MAX_PLAYER_NAME = 32;
 const MAX_BODY_BYTES = 128 * 1024;
 const MAX_SDP_BYTES = 64 * 1024;
@@ -133,6 +142,22 @@ function enqueue(participant: Participant, message: SignalMessage): void {
   }
 }
 
+function enqueueRelay(participant: Participant, message: RelayMessage): void {
+  participant.relayQueue.push(message);
+  if (participant.relayQueue.length > MAX_RELAY_QUEUE_MESSAGES) {
+    participant.relayQueue.splice(0, participant.relayQueue.length - MAX_RELAY_QUEUE_MESSAGES);
+  }
+}
+
+async function longPollRelay(participant: Participant): Promise<Response> {
+  const deadline = now() + LONG_POLL_MS;
+  while (participant.relayQueue.length === 0 && now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const messages = participant.relayQueue.splice(0, participant.relayQueue.length);
+  return json(messages);
+}
+
 function removeExpiredRooms(): void {
   const cutoff = now() - ROOM_TTL_MS;
   for (const [code, room] of rooms) {
@@ -192,6 +217,7 @@ function promoteHost(room: Room, winner: Participant): void {
   // temporarily only so their existing session token can authenticate /migrate.
   for (const client of room.clients.values()) {
     client.queue = [];
+    client.relayQueue = [];
   }
   touch(room, room.host);
 }
@@ -218,6 +244,7 @@ async function handle(req: Request): Promise<Response> {
       service: "Multiplayer Edit X signaling",
       apiVersion: 2,
       rooms: rooms.size,
+      transports: ["webrtc", "http-relay-v1"],
     });
   }
 
@@ -241,6 +268,7 @@ async function handle(req: Request): Promise<Response> {
       joinedAt: current,
       lastSeenAt: current,
       queue: [],
+      relayQueue: [],
     };
     const room: Room = {
       roomId: randomHex(16),
@@ -261,6 +289,7 @@ async function handle(req: Request): Promise<Response> {
       sessionToken: host.token,
       generation: room.generation,
       signalingApi: 2,
+      relayApi: 1,
     }, 201);
   }
 
@@ -298,6 +327,7 @@ async function handle(req: Request): Promise<Response> {
         joinedAt: current,
         lastSeenAt: current,
         queue: [],
+        relayQueue: [],
       };
       room.clients.set(playerId, participant);
       touch(room, participant);
@@ -316,6 +346,7 @@ async function handle(req: Request): Promise<Response> {
         sessionToken: participant.token,
         generation: room.generation,
         signalingApi: 2,
+        relayApi: 1,
       });
     }
 
@@ -370,6 +401,41 @@ async function handle(req: Request): Promise<Response> {
         generation: room.generation,
         retryAfterMs: isCurrentHost ? 0 : 350,
       });
+    }
+
+    if (req.method === "GET" && parts.length === 3 && parts[2] === "relay") {
+      const token = bearerToken(req);
+      const participant = findParticipant(room, token);
+      if (!participant) return json({ error: "unauthorized" }, 401);
+      touch(room, participant);
+      return await longPollRelay(participant);
+    }
+
+    if (req.method === "POST" && parts.length === 3 && parts[2] === "relay") {
+      const token = bearerToken(req);
+      const sender = findParticipant(room, token);
+      if (!sender) return json({ error: "unauthorized" }, 401);
+
+      const body = await readJson(req);
+      if (!body) return json({ error: "invalid request body" }, 400);
+      const payload = typeof body.payload === "string" ? body.payload : "";
+      const channel = body.channel === "unreliable" ? "unreliable" : "reliable";
+      if (!payload || payload.length > MAX_RELAY_PAYLOAD_HEX || (payload.length % 2) !== 0 || !/^[0-9a-fA-F]+$/.test(payload)) {
+        return json({ error: "invalid relay payload" }, 400);
+      }
+
+      const isHost = sender.token === room.host.token;
+      if (isHost) {
+        const targetId = Number(body.targetPlayerId ?? -1);
+        const target = room.clients.get(targetId);
+        if (!target) return json({ error: "target client not found" }, 404);
+        enqueueRelay(target, { fromPlayerId: 0, channel, payload });
+      } else {
+        enqueueRelay(room.host, { fromPlayerId: sender.playerId, channel, payload });
+      }
+
+      touch(room, sender);
+      return json({ ok: true });
     }
 
     if (req.method === "GET" && parts.length === 3 && parts[2] === "signal") {

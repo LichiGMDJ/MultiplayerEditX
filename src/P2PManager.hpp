@@ -162,6 +162,7 @@ namespace mpedit {
             std::deque<uint32_t> receivedReliableOrder;
             bool reconnecting = false;
             bool connectionAnnounced = false;
+            bool httpRelay = false;
             std::vector<PendingCandidate> pendingCandidates;
         };
 
@@ -175,6 +176,13 @@ namespace mpedit {
         void stopSignalPolling();
         void sendSignalingMessage(std::string const& roomCode, matjson::Value const& msg);
         void handleSignalingMessages(matjson::Value const& messages);
+        void startHttpRelayPolling(std::string const& code);
+        void pollHttpRelayOnce(std::string const& code);
+        void stopHttpRelayPolling();
+        void sendHttpRelayPacket(int playerId, std::vector<uint8_t> const& data, ChannelType channel);
+        void handleHttpRelayMessages(matjson::Value const& messages);
+        void activateHttpRelayForPeer(int playerId);
+        void scheduleHttpRelayFallback(int playerId);
 
         void onPeerMessage(int fromPlayerId, const uint8_t* data, size_t len);
         void onPeerDisconnected(int playerId, bool unexpected);
@@ -230,9 +238,11 @@ namespace mpedit {
 
 
         geode::async::TaskHolder<geode::utils::web::WebResponse> m_signalingListener;  // room create/join
-        geode::async::TaskHolder<geode::utils::web::WebResponse> m_signalPollListener; // long-poll loop
+        geode::async::TaskHolder<geode::utils::web::WebResponse> m_signalPollListener; // signaling long-poll loop
+        geode::async::TaskHolder<geode::utils::web::WebResponse> m_httpRelayPollListener;
         geode::async::TaskHolder<geode::utils::web::WebResponse> m_migrationListener;
         std::atomic<bool> m_signalingActive{false};
+        std::atomic<bool> m_httpRelayPollingActive{false};
         std::atomic<bool> m_hostMigrationAvailable{false};
         std::string m_signalingRoomId;   // server-side room ID
         std::string m_signalingToken;

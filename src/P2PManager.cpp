@@ -33,6 +33,37 @@ namespace mpedit {
                 opcode == proto::Opcode::UpdateSettings ||
                 opcode == proto::Opcode::BulkPasteEnd;
         }
+
+        std::string bytesToHex(std::vector<uint8_t> const& data) {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string out;
+            out.resize(data.size() * 2);
+            for (size_t i = 0; i < data.size(); ++i) {
+                out[i * 2] = kHex[(data[i] >> 4) & 0x0f];
+                out[i * 2 + 1] = kHex[data[i] & 0x0f];
+            }
+            return out;
+        }
+
+        int hexNibble(char c) {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+
+        bool hexToBytes(std::string const& text, std::vector<uint8_t>& out) {
+            if (text.empty() || (text.size() % 2) != 0) return false;
+            out.clear();
+            out.reserve(text.size() / 2);
+            for (size_t i = 0; i < text.size(); i += 2) {
+                int hi = hexNibble(text[i]);
+                int lo = hexNibble(text[i + 1]);
+                if (hi < 0 || lo < 0) return false;
+                out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+            }
+            return true;
+        }
     }
 
     P2PManager& P2PManager::get() {
@@ -70,32 +101,21 @@ namespace mpedit {
             config.iceServers.push_back(customTurn);
         }
 
-        // 0.5.2 always exposed this TURN/TCP relay to ICE. Restoring it as a
-        // compatibility fallback reproduces the old zero-configuration behavior:
-        // direct/STUN candidates are still preferred, but restrictive NAT/CGNAT or
-        // blocked UDP can transparently fall back to TURN over TCP/443.
-        rtc::IceServer compatibilityTurn(
-            "openrelay.metered.ca", 443,
-            "openrelayproject", "openrelayproject",
-            rtc::IceServer::RelayType::TurnTcp
-        );
-        config.iceServers.push_back(compatibilityTurn);
-
         if (network.forceTurnRelay || forceRelay) {
-            config.iceTransportPolicy = rtc::TransportPolicy::Relay;
-            if (forceRelay && !network.forceTurnRelay) {
-                log::warn("P2PManager: direct/STUN negotiation failed; retrying with relay-only ICE");
+            if (customTurnAvailable) {
+                config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+                if (forceRelay && !network.forceTurnRelay) {
+                    log::warn("P2PManager: direct/STUN negotiation failed; retrying with configured TURN/UDP");
+                } else {
+                    log::warn("P2PManager: Force TURN diagnostic mode enabled");
+                }
             } else {
-                log::warn("P2PManager: Force TURN diagnostic mode enabled");
+                log::warn("P2PManager: relay-only ICE requested but custom TURN is not configured; HTTP relay remains available");
             }
         } else if (customTurnAvailable) {
-            log::info(
-                "P2PManager: ICE auto mode: direct/STUN preferred, custom TURN/UDP + compatibility TURN/TCP fallback available"
-            );
+            log::info("P2PManager: ICE auto mode: direct/STUN preferred, custom TURN/UDP fallback available");
         } else {
-            log::info(
-                "P2PManager: ICE auto mode: direct/STUN preferred, compatibility TURN/TCP fallback available"
-            );
+            log::info("P2PManager: ICE direct/STUN mode; HTTP relay fallback available");
         }
 
         return config;
@@ -334,6 +354,11 @@ namespace mpedit {
             peer.pendingMessages.push_back({data, channel});
             return;
         }
+        if (peer.httpRelay) {
+            sendHttpRelayPacket(playerId, data, channel);
+            return;
+        }
+
         auto& dc = (channel == ChannelType::Reliable) ? peer.reliable : peer.unreliable;
 
         if (dc && dc->isOpen()) {
@@ -1037,6 +1062,7 @@ namespace mpedit {
                     }
 
                     startSignalPolling(roomCode, "host", 0);
+                    startHttpRelayPolling(roomCode);
                 } else {
                     std::vector<ErrorCb> callbacks;
                     std::string err;
@@ -1429,6 +1455,14 @@ namespace mpedit {
                                 }
                             }
                             if (!currentPeer) return; // stale Closed/Failed callback
+                            {
+                                std::lock_guard lock(m_peersMutex);
+                                auto it = m_peers.find(0);
+                                if (it != m_peers.end() && it->second.httpRelay) {
+                                    log::debug("P2PManager: ignoring WebRTC state change after HTTP relay takeover");
+                                    return;
+                                }
+                            }
 
                             auto network = net::NetworkConfig::load();
                             if (!transportReady && !relayRetry && !network.forceTurnRelay && network.hasTurn()) {
@@ -1458,6 +1492,8 @@ namespace mpedit {
                     }
 
                     startSignalPolling(roomCode, "client", m_localPlayerId);
+                    startHttpRelayPolling(roomCode);
+                    scheduleHttpRelayFallback(0);
 
                 } else if (res.code() == 404) {
                     if (m_state.load() == State::Reconnecting) {
@@ -1583,6 +1619,14 @@ namespace mpedit {
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
                 queueInMainThread([this, clientPlayerId]() {
+                    {
+                        std::lock_guard lock(m_peersMutex);
+                        auto it = m_peers.find(clientPlayerId);
+                        if (it != m_peers.end() && it->second.httpRelay) {
+                            log::debug("P2PManager: ignoring host WebRTC failure for HTTP relay peer {}", clientPlayerId);
+                            return;
+                        }
+                    }
                     onPeerDisconnected(clientPlayerId, true);
                 });
             }
@@ -1772,8 +1816,9 @@ namespace mpedit {
             auto& peer = it->second;
             bool reliableOpen = peer.reliable && peer.reliable->isOpen();
             bool unreliableOpen = peer.unreliable && peer.unreliable->isOpen();
+            bool transportOpen = peer.httpRelay || (reliableOpen && unreliableOpen);
 
-            if (reliableOpen && unreliableOpen && !peer.ready) {
+            if (transportOpen && !peer.ready) {
                 peer.ready = true;
                 pid = peer.playerId;
                 name = peer.playerName;
@@ -1794,6 +1839,128 @@ namespace mpedit {
 
 
 
+
+    void P2PManager::startHttpRelayPolling(std::string const& code) {
+        m_httpRelayPollingActive.store(true);
+        pollHttpRelayOnce(code);
+    }
+
+    void P2PManager::stopHttpRelayPolling() {
+        m_httpRelayPollingActive.store(false);
+        m_httpRelayPollListener.cancel();
+    }
+
+    void P2PManager::pollHttpRelayOnce(std::string const& code) {
+        if (!m_httpRelayPollingActive.load() || m_signalingToken.empty()) return;
+
+        auto req = web::WebRequest();
+        req.header("Authorization", "Bearer " + m_signalingToken);
+        req.timeout(std::chrono::seconds(30));
+        auto url = getSignalingUrl() + "/rooms/" + code + "/relay";
+
+        m_httpRelayPollListener.spawn(
+            req.get(url),
+            [this, code](web::WebResponse res) {
+                if (!m_httpRelayPollingActive.load()) return;
+                if (res.ok()) {
+                    handleHttpRelayMessages(res.json().unwrapOr(matjson::Value()));
+                } else if (res.code() == 401 || res.code() == 403 || res.code() == 404) {
+                    log::warn("P2PManager: HTTP relay poll stopped with {}", res.code());
+                    m_httpRelayPollingActive.store(false);
+                    return;
+                } else {
+                    log::warn("P2PManager: HTTP relay poll returned {}", res.code());
+                }
+
+                if (m_httpRelayPollingActive.load()) pollHttpRelayOnce(code);
+            }
+        );
+    }
+
+    void P2PManager::sendHttpRelayPacket(int playerId, std::vector<uint8_t> const& data, ChannelType channel) {
+        if (data.empty() || m_signalingToken.empty()) return;
+        constexpr size_t kMaxRelayPacketBytes = 48 * 1024;
+        if (data.size() > kMaxRelayPacketBytes) {
+            log::warn("P2PManager: HTTP relay packet too large ({} bytes)", data.size());
+            return;
+        }
+
+        auto body = matjson::Value();
+        body["targetPlayerId"] = playerId;
+        body["channel"] = channel == ChannelType::Reliable ? "reliable" : "unreliable";
+        body["payload"] = bytesToHex(data);
+
+        auto req = web::WebRequest();
+        req.header("Content-Type", "application/json");
+        req.header("Authorization", "Bearer " + m_signalingToken);
+        req.bodyJSON(body);
+        auto url = getSignalingUrl() + "/rooms/" + getRoomCode() + "/relay";
+        async::spawn(req.post(url));
+    }
+
+    void P2PManager::handleHttpRelayMessages(matjson::Value const& messages) {
+        if (!messages.isArray()) return;
+
+        for (size_t i = 0; i < messages.size(); ++i) {
+            auto item = messages.get(i);
+            if (!item.isOk()) continue;
+            auto msg = item.unwrap();
+            int fromId = msg.get<int>("fromPlayerId").unwrapOr(-1);
+            auto payloadHex = msg.get<std::string>("payload").unwrapOr("");
+            if (fromId < 0 || payloadHex.empty()) continue;
+
+            std::vector<uint8_t> payload;
+            if (!hexToBytes(payloadHex, payload) || payload.empty() || payload.size() > 48 * 1024) {
+                log::warn("P2PManager: rejected malformed HTTP relay packet from {}", fromId);
+                continue;
+            }
+
+            bool newlyRelayed = false;
+            {
+                std::lock_guard lock(m_peersMutex);
+                auto it = m_peers.find(fromId);
+                if (it == m_peers.end()) continue;
+                if (!it->second.httpRelay) {
+                    it->second.httpRelay = true;
+                    it->second.ready = true;
+                    newlyRelayed = true;
+                }
+            }
+            if (newlyRelayed) {
+                log::warn("P2PManager: peer {} switched to HTTP relay transport", fromId);
+            }
+
+            onPeerMessage(fromId, payload.data(), payload.size());
+        }
+    }
+
+    void P2PManager::activateHttpRelayForPeer(int playerId) {
+        bool activate = false;
+        {
+            std::lock_guard lock(m_peersMutex);
+            auto it = m_peers.find(playerId);
+            if (it == m_peers.end()) return;
+            if (it->second.connectionAnnounced || it->second.httpRelay) return;
+            it->second.httpRelay = true;
+            it->second.ready = true;
+            activate = true;
+        }
+        if (!activate) return;
+
+        log::warn("P2PManager: WebRTC not ready; activating HTTP relay transport for player {}", playerId);
+        auto hello = proto::serializeProtocolHello(net::kCurrentProtocol, net::kLocalCapabilities);
+        sendTo(playerId, hello, ChannelType::Reliable);
+    }
+
+    void P2PManager::scheduleHttpRelayFallback(int playerId) {
+        std::thread([this, playerId]() {
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            queueInMainThread([this, playerId]() {
+                if (m_state.load() == State::Disconnected || m_state.load() == State::Error) return;
+                activateHttpRelayForPeer(playerId);
+            });
+        }).detach();
+    }
 
     void P2PManager::requestHostMigration() {
         if (m_role != Role::Client || m_roomCode.empty() || m_signalingToken.empty()) {
@@ -1910,6 +2077,7 @@ namespace mpedit {
 
     void P2PManager::leaveSession() {
         stopSignalPolling();
+        stopHttpRelayPolling();
 
         {
             std::lock_guard lock(m_peersMutex);

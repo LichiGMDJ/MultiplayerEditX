@@ -53,9 +53,10 @@ jobs:
           p2ph = Path("src/P2PManager.hpp").read_text(encoding="utf-8")
           hooks = Path("src/EditorHooks.cpp").read_text(encoding="utf-8")
           remote = Path("src/RemoteActionHandler.cpp").read_text(encoding="utf-8")
+          popup = Path("src/ui/MultiplayerPopup.cpp").read_text(encoding="utf-8")
+          discovery = Path("src/ui/RoomDiscoveryPopups.cpp").read_text(encoding="utf-8")
           capabilities = Path("src/net/ProtocolCapabilities.hpp").read_text(encoding="utf-8")
           network = Path("src/net/NetworkConfig.hpp").read_text(encoding="utf-8")
-          adaptive = Path("src/sync/AdaptiveSyncPolicy.hpp").read_text(encoding="utf-8")
           signaling = Path("server/signaling/server.ts").read_text(encoding="utf-8")
 
           # Protocol and transport architecture.
@@ -80,7 +81,26 @@ jobs:
           assert "signaling POST {} failed" in p2p
           assert "requestHostMigration" in p2p
 
-          # Level/object synchronization must survive networking refactors.
+          # Room discovery / privacy / password UI and API.
+          for token in ["Public Rooms", "Private Room", "CreateRoomPopup", "RoomBrowserPopup"]:
+              assert token in (popup + discovery), token
+          for token in ["Password Required", "Room name", "Player limit", "hasPassword"]:
+              assert token in discovery, token
+          assert "patreon.com" not in popup.lower()
+          assert "Patreon" not in popup
+          assert not Path(".github/FUNDING.yml").exists()
+          for token in [
+              'req.method === "GET" && path === "/rooms"', "isPrivate", "passwordRequired",
+              "playerLimit", "hasPassword", "roomName", "description",
+          ]:
+              assert token in signaling, token
+          assert ".filter((room) => !room.isPrivate)" in signaling
+          assert "Invalid room password" in p2p
+          assert "m_pendingJoinPassword" in p2ph
+          assert "unsafe popup owner access remains" not in discovery
+          assert 'this->onClose(nullptr);\n    m_owner->' not in discovery
+
+          # Level/object synchronization must survive networking/UI refactors.
           for token in [
               "s_startPosObjects", "s_startPosSaveStrings", "m_objectID == 31",
               "encodeLayerTaggedUuid", "objectLayerSyncState",
@@ -107,7 +127,7 @@ jobs:
           assert "!candidate || !mid" not in signaling
           assert "194.226.126.115" not in p2p
 
-          print("v0.5.3 transport + synchronization architecture verification passed")
+          print("v0.5.3 transport + room discovery + synchronization verification passed")
           PY
 
       - name: Build

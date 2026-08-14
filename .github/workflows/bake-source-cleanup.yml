@@ -46,7 +46,7 @@ jobs:
           grep -q 'encodeLayerTaggedUuid' src/EditorHooks.cpp
           grep -q 'objectLayerSyncState' src/EditorHooks.cpp
           grep -q 'decodeLayerTaggedUuid' src/RemoteActionHandler.cpp
-          grep -q 'applyEditorLayers(match, tagged.editorLayer, tagged.editorLayer2)' src/RemoteActionHandler.cpp
+          grep -q 'applyEditorLayers(match, tagged.layer1, tagged.layer2)' src/RemoteActionHandler.cpp
           grep -q 'Must remain last. A callback reached from here may destroy the popup' src/ui/MultiplayerPopup.cpp
 
       - name: Remove patch infrastructure and legacy build dump
@@ -58,7 +58,6 @@ jobs:
           rm -rf MultiplayerEdit-LEGACY-0.3.0
           rm -f .github/workflows/bake-source-cleanup.yml
 
-          # These markers only existed to satisfy old patch-driven workflow checks.
           sed -i '/legacy workflow marker:/d' src/P2PManager.cpp
           sed -i '/legacy workflow marker:/d' src/EditorHooks.cpp
           sed -i '/legacy workflow marker:/d' src/RemoteActionHandler.cpp

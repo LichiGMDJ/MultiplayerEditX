@@ -34,7 +34,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify source metadata
+      - name: Verify source architecture
         shell: bash
         run: |
           python - <<'PY'
@@ -48,12 +48,25 @@ jobs:
           p2p = Path("src/P2PManager.cpp").read_text(encoding="utf-8")
           hooks = Path("src/EditorHooks.cpp").read_text(encoding="utf-8")
           remote = Path("src/RemoteActionHandler.cpp").read_text(encoding="utf-8")
+          capabilities = Path("src/net/ProtocolCapabilities.hpp").read_text(encoding="utf-8")
+          adaptive = Path("src/sync/AdaptiveSyncPolicy.hpp").read_text(encoding="utf-8")
+          signaling = Path("server/signaling/server.ts").read_text(encoding="utf-8")
 
-          assert "kProtocolVersion = 7" in p2p
+          assert "kCurrentProtocol = 8" in capabilities
+          assert "HostMigration" in capabilities
+          assert "AdaptiveSync" in capabilities
+          assert "SecureSignaling" in capabilities
+          assert "serializeProtocolHello(net::kCurrentProtocol" in p2p
+          assert "requestHostMigration" in p2p
+          assert "AdaptiveSyncPolicy" in hooks
+          assert "SYNC PERF" in hooks
           assert "encodeLayerTaggedUuid" in hooks
-          assert "objectLayerSyncState" in hooks
           assert "decodeLayerTaggedUuid" in remote
           assert "applyEditorLayers(match, tagged.layer1, tagged.layer2)" in remote
+          assert "sessionToken" in signaling
+          assert 'parts[2] === "migrate"' in signaling
+          assert "194.226.126.115" not in p2p
+          print("v0.5.3 architecture verification passed")
           PY
 
       - name: Build

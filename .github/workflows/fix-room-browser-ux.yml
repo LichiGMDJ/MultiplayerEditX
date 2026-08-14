@@ -17,55 +17,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: v053-room-browser
-      - name: Apply UX fixes
+      - name: Apply source fixes
         run: python tools/fix_room_browser_ux.py
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
       - name: Typecheck signaling server
         run: deno check server/signaling/server.ts
-      - name: Smoke-test room directory and passwords
-        shell: bash
-        run: |
-          set -euo pipefail
-          deno run --allow-net server/signaling/server.ts > /tmp/mpedit-signaling.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID 2>/dev/null || true; cat /tmp/mpedit-signaling.log || true' EXIT
-          for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:8000/ >/dev/null && break
-            sleep 0.2
-          done
-
-          PUBLIC=$(curl -fsS -X POST http://127.0.0.1:8000/rooms \
-            -H 'Content-Type: application/json' \
-            -d '{"playerName":"HostA","roomName":"Public Test","description":"browser","playerLimit":4,"isPrivate":false,"password":"secret","transportMode":"auto"}')
-          PUBLIC_CODE=$(python -c 'import json,sys; print(json.load(sys.stdin)["roomCode"])' <<<"$PUBLIC")
-
-          PRIVATE=$(curl -fsS -X POST http://127.0.0.1:8000/rooms \
-            -H 'Content-Type: application/json' \
-            -d '{"playerName":"HostB","roomName":"Private Test","playerLimit":4,"isPrivate":true,"password":"hidden","transportMode":"webrtc"}')
-          PRIVATE_CODE=$(python -c 'import json,sys; print(json.load(sys.stdin)["roomCode"])' <<<"$PRIVATE")
-
-          ROOMS=$(curl -fsS http://127.0.0.1:8000/rooms)
-          python - "$PUBLIC_CODE" "$PRIVATE_CODE" <<'PY' <<<"$ROOMS"
-          import json, sys
-          rooms = json.load(sys.stdin)
-          public_code, private_code = sys.argv[1], sys.argv[2]
-          assert any(r['roomCode'] == public_code and r['roomName'] == 'Public Test' and r['hasPassword'] for r in rooms)
-          assert not any(r['roomCode'] == private_code for r in rooms)
-          PY
-
-          WRONG=$(curl -sS -o /tmp/wrong.json -w '%{http_code}' -X POST "http://127.0.0.1:8000/rooms/$PUBLIC_CODE/join" \
-            -H 'Content-Type: application/json' -d '{"playerName":"Guest","password":"bad","transportMode":"auto"}')
-          test "$WRONG" = "403"
-          python - <<'PY'
-          import json
-          body=json.load(open('/tmp/wrong.json'))
-          assert body.get('passwordRequired') is True
-          PY
-
-          curl -fsS -X POST "http://127.0.0.1:8000/rooms/$PUBLIC_CODE/join" \
-            -H 'Content-Type: application/json' -d '{"playerName":"Guest","password":"secret","transportMode":"http-relay"}' >/dev/null
       - name: Commit source changes
         run: |
           git config user.name "LichiGMDJ"

@@ -165,7 +165,7 @@ namespace mpedit {
             std::vector<PendingCandidate> pendingCandidates;
         };
 
-        rtc::Configuration makeRtcConfig();
+        rtc::Configuration makeRtcConfig(bool forceRelay = false);
         void createHostPeer(int clientPlayerId, std::string const& clientName);
 
         void signalingCreateRoom(std::string const& playerName);
@@ -202,6 +202,7 @@ namespace mpedit {
         int m_nextPlayerId = 1; // host assigns IDs (host = 0)
         std::unordered_map<std::string, uint64_t> m_recentDisconnectedNames;
         std::atomic<bool> m_reconnectScheduled{false};
+        std::atomic<bool> m_forceRelayNextJoin{false};
         int m_reconnectAttempts = 0;
         std::atomic<uint32_t> m_globalRevision{0};
         std::atomic<int> m_lastGlobalAuthor{0};

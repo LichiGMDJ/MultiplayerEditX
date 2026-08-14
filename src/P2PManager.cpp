@@ -50,7 +50,7 @@ namespace mpedit {
 
 
 
-    rtc::Configuration P2PManager::makeRtcConfig() {
+    rtc::Configuration P2PManager::makeRtcConfig(bool forceRelay) {
         rtc::Configuration config;
         config.iceServers.push_back({"stun:stun.l.google.com:19302"});
         config.iceServers.push_back({"stun:stun.cloudflare.com:3478"});
@@ -62,9 +62,13 @@ namespace mpedit {
                 rtc::IceServer::RelayType::TurnUdp
             );
             config.iceServers.push_back(turn);
-            if (network.forceTurnRelay) {
+            if (network.forceTurnRelay || forceRelay) {
                 config.iceTransportPolicy = rtc::TransportPolicy::Relay;
-                log::warn("P2PManager: Force TURN diagnostic mode enabled");
+                if (forceRelay && !network.forceTurnRelay) {
+                    log::warn("P2PManager: direct/STUN negotiation failed; retrying with TURN relay only");
+                } else {
+                    log::warn("P2PManager: Force TURN diagnostic mode enabled");
+                }
             } else {
                 log::info("P2PManager: ICE auto mode: direct/STUN preferred, TURN fallback available");
             }
@@ -891,17 +895,21 @@ namespace mpedit {
     }
 
     void P2PManager::onPeerDisconnected(int playerId, bool unexpected) {
+        std::shared_ptr<rtc::PeerConnection> pcToClose;
         {
             std::lock_guard lock(m_peersMutex);
             auto it = m_peers.find(playerId);
-            if (it != m_peers.end()) {
-                if (unexpected && m_role == Role::Host && !it->second.playerName.empty()) {
-                    m_recentDisconnectedNames[it->second.playerName] = reliabilityNowMs();
-                }
-                if (it->second.pc) it->second.pc->close();
-                m_peers.erase(it);
+            if (it == m_peers.end()) {
+                log::debug("P2PManager: ignoring duplicate disconnect for player {}", playerId);
+                return;
             }
+            if (unexpected && m_role == Role::Host && !it->second.playerName.empty()) {
+                m_recentDisconnectedNames[it->second.playerName] = reliabilityNowMs();
+            }
+            pcToClose = it->second.pc;
+            m_peers.erase(it);
         }
+        if (pcToClose) pcToClose->close();
 
         log::info("P2PManager: Player {} disconnected (unexpected={})", playerId, unexpected);
 
@@ -1051,6 +1059,18 @@ namespace mpedit {
                     handleSignalingMessages(json);
                 } else {
                     log::warn("P2PManager: Signal poll returned {}", res.code());
+                    if (res.code() == 401 || res.code() == 403) {
+                        m_signalingActive.store(false);
+                        if (m_role == Role::Client) {
+                            m_state.store(State::Reconnecting);
+                            queueInMainThread([this]() { scheduleClientReconnect(); });
+                        } else {
+                            queueInMainThread([this]() {
+                                for (auto& cb : m_onError) cb("Signaling authentication failed");
+                            });
+                        }
+                        return;
+                    }
                 }
 
                 if (m_signalingActive.load()) {
@@ -1149,7 +1169,9 @@ namespace mpedit {
                             }
                             it->second.pendingCandidates.clear();
 
-                            it->second.pc->setLocalDescription();
+                            // libdatachannel generates the answer after a remote offer.
+                            // Do not force a second local description here; Android was
+                            // producing duplicate SDP answers from this path.
                         } else {
                             log::warn("P2PManager: Ignoring duplicate offer (state={})", (int)state);
                         }
@@ -1204,6 +1226,7 @@ namespace mpedit {
         m_state.store(State::Connecting);
         m_globalRevision.store(0);
         m_lastGlobalAuthor.store(0);
+        m_forceRelayNextJoin.store(false);
 
         signalingJoinRoom(roomCode, playerName);
     }
@@ -1255,7 +1278,8 @@ namespace mpedit {
 
                     log::info("P2PManager: Joined room {} as player {}", roomCode, m_localPlayerId);
 
-                    auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig());
+                    bool relayRetry = m_forceRelayNextJoin.exchange(false);
+                    auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig(relayRetry));
 
                     PeerInfo hostPeer;
                     hostPeer.pc = pc;
@@ -1362,15 +1386,47 @@ namespace mpedit {
                         }
                     });
 
-                    pc->onStateChange([this](rtc::PeerConnection::State state) {
+                    pc->onStateChange([this, pc, relayRetry](rtc::PeerConnection::State state) {
                         log::info("P2PManager: client PeerConnection state={}", static_cast<int>(state));
-                        if (state == rtc::PeerConnection::State::Disconnected ||
-                            state == rtc::PeerConnection::State::Failed ||
-                            state == rtc::PeerConnection::State::Closed) {
-                            queueInMainThread([this]() {
-                                onPeerDisconnected(0, true);
-                            });
+                        if (state != rtc::PeerConnection::State::Disconnected &&
+                            state != rtc::PeerConnection::State::Failed &&
+                            state != rtc::PeerConnection::State::Closed) {
+                            return;
                         }
+
+                        queueInMainThread([this, pc, relayRetry]() {
+                            bool currentPeer = false;
+                            bool transportReady = false;
+                            {
+                                std::lock_guard lock(m_peersMutex);
+                                auto it = m_peers.find(0);
+                                if (it != m_peers.end() && it->second.pc == pc) {
+                                    currentPeer = true;
+                                    transportReady = it->second.ready || it->second.connectionAnnounced;
+                                }
+                            }
+                            if (!currentPeer) return; // stale Closed/Failed callback
+
+                            auto network = net::NetworkConfig::load();
+                            if (!transportReady && !relayRetry && !network.forceTurnRelay && network.hasTurn()) {
+                                log::warn("P2PManager: initial direct/STUN ICE failed; scheduling relay-only retry");
+                                {
+                                    std::lock_guard lock(m_peersMutex);
+                                    auto it = m_peers.find(0);
+                                    if (it != m_peers.end() && it->second.pc == pc) {
+                                        m_peers.erase(it);
+                                    }
+                                }
+                                pc->close();
+                                stopSignalPolling();
+                                m_forceRelayNextJoin.store(true);
+                                m_state.store(State::Reconnecting);
+                                scheduleClientReconnect();
+                                return;
+                            }
+
+                            onPeerDisconnected(0, true);
+                        });
                     });
 
                     {
@@ -1420,7 +1476,7 @@ namespace mpedit {
 
 
     void P2PManager::createHostPeer(int clientPlayerId, std::string const& clientName) {
-        auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig());
+        auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig(false));
         auto roomCode = getRoomCode();
         auto offerSent = std::make_shared<bool>(false);
 
@@ -1494,7 +1550,7 @@ namespace mpedit {
             });
         });
 
-        pc->onStateChange([this, clientPlayerId](rtc::PeerConnection::State state) {
+        pc->onStateChange([this, pc, clientPlayerId](rtc::PeerConnection::State state) {
             log::info(
                 "P2PManager: host PeerConnection state={} player={}",
                 static_cast<int>(state),

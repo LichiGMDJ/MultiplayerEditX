@@ -377,14 +377,10 @@ async function handle(req: Request): Promise<Response> {
       const participant = findParticipant(room, token);
       if (!participant) return json({ error: "unauthorized" }, 401);
 
-      const requestedRole = url.searchParams.get("role") ?? "";
-      if (requestedRole === "host" && participant.token !== room.host.token) {
-        return json({ error: "host token required" }, 403);
-      }
-      if (requestedRole === "client" && participant.token === room.host.token) {
-        return json({ error: "client token required" }, 403);
-      }
-
+      // The bearer token is the authoritative signaling identity. Do not reject
+      // an authenticated long-poll solely because the client's cached role is
+      // stale during host migration or reconnect; that created false 403 loops.
+      // Routing still uses the participant queue bound to this token.
       touch(room, participant);
       return await longPoll(participant);
     }

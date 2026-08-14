@@ -1,0 +1,35 @@
+name: Fix HTTP Relay Reliability
+
+on:
+  push:
+    branches:
+      - v053-upstream050-integration
+    paths:
+      - tools/fix-http-relay-reliability.trigger
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v053-upstream050-integration
+          fetch-depth: 0
+      - name: Apply relay reliability fix
+        run: |
+          python3 -m py_compile tools/fix_http_relay_reliability.py
+          python3 tools/fix_http_relay_reliability.py
+      - name: Verify invariants
+        run: |
+          python3 tools/verify_upstream050_integration.py
+          git diff --check
+      - name: Commit source fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/P2PManager.cpp src/P2PManager.hpp tools/verify_upstream050_integration.py
+          git commit -m 'fix: preserve ordered reliable delivery over HTTP relay' || exit 0
+          git push origin v053-upstream050-integration

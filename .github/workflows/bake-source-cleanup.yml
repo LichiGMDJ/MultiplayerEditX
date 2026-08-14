@@ -61,6 +61,7 @@ jobs:
           sed -i '/legacy workflow marker:/d' src/P2PManager.cpp
           sed -i '/legacy workflow marker:/d' src/EditorHooks.cpp
           sed -i '/legacy workflow marker:/d' src/RemoteActionHandler.cpp
+          sed -i '/finalize compatibility marker:/d' src/RemoteActionHandler.cpp
 
       - name: Commit baked source
         shell: bash

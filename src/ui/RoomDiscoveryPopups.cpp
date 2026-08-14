@@ -130,8 +130,9 @@ void CreateRoomPopup::onCreate(CCObject*) {
     }
     playerLimit = std::clamp(playerLimit, 2, 16);
 
+    auto* owner = m_owner;
     this->onClose(nullptr);
-    m_owner->beginHost(roomName, description, playerLimit, m_private, password);
+    owner->beginHost(roomName, description, playerLimit, m_private, password);
 }
 
 PasswordPopup* PasswordPopup::create(MultiplayerPopup* owner, std::string roomCode, std::string roomName) {
@@ -171,8 +172,10 @@ bool PasswordPopup::setup() {
 void PasswordPopup::onJoin(CCObject*) {
     if (!m_owner || !m_passwordInput) return;
     auto password = trimmed(std::string(m_passwordInput->getString()), 48);
+    auto* owner = m_owner;
+    auto roomCode = m_roomCode;
     this->onClose(nullptr);
-    m_owner->beginJoin(m_roomCode, password);
+    owner->beginJoin(roomCode, password);
 }
 
 PrivateRoomPopup* PrivateRoomPopup::create(MultiplayerPopup* owner) {
@@ -222,8 +225,9 @@ void PrivateRoomPopup::onJoin(CCObject*) {
         return static_cast<char>(std::toupper(c));
     });
     auto password = trimmed(std::string(m_passwordInput->getString()), 48);
+    auto* owner = m_owner;
     this->onClose(nullptr);
-    m_owner->beginJoin(code, password);
+    owner->beginJoin(code, password);
 }
 
 RoomBrowserPopup* RoomBrowserPopup::create(MultiplayerPopup* owner) {
@@ -383,8 +387,10 @@ void RoomBrowserPopup::onJoin(CCObject* sender) {
             popup->show();
         }
     } else {
+        auto* owner = m_owner;
+        auto code = room.roomCode;
         this->onClose(nullptr);
-        m_owner->beginJoin(room.roomCode, "");
+        owner->beginJoin(code, "");
     }
 }
 

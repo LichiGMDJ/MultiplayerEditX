@@ -1,6 +1,6 @@
 from pathlib import Path
 
-# Keep the existing workflow's legacy string checks green while runtime uses v6.
+# Keep the existing workflow's legacy string checks green while runtime uses v7.
 p2p_path = Path("src/P2PManager.cpp")
 p2p = p2p_path.read_text(encoding="utf-8")
 if "legacy workflow marker: kProtocolVersion = 2" not in p2p:
@@ -41,8 +41,16 @@ if not connection_diag_path.exists():
     raise SystemExit("v0.5.2 connection diagnostics patch missing")
 exec(compile(connection_diag_path.read_text(encoding="utf-8"), str(connection_diag_path), "exec"), {"__name__": "__main__"})
 
+# v0.5.3 is intentionally the very last semantic patch. It operates on the final
+# generated source and preserves Editor Layer 1/2 across normal object recreation,
+# authoritative SyncLevel, RAW/Object Workshop paste and integrity repair.
+editor_layers_path = Path("scripts/patch_v053_editor_layers.py")
+if not editor_layers_path.exists():
+    raise SystemExit("v0.5.3 editor layer preservation patch missing")
+exec(compile(editor_layers_path.read_text(encoding="utf-8"), str(editor_layers_path), "exec"), {"__name__": "__main__"})
+
 checks = [
-    ("src/P2PManager.cpp", "kProtocolVersion = 6", "Protocol v6 missing"),
+    ("src/P2PManager.cpp", "kProtocolVersion = 7", "Protocol v7 missing"),
     ("src/P2PManager.cpp", "GLOBAL REV", "global revision sequencer missing"),
     ("src/P2PManager.cpp", "kickPlayer(int playerId)", "host kick implementation missing"),
     ("src/P2PManager.cpp", "ROOM SETTINGS", "Room Settings broadcast/logging missing"),
@@ -71,6 +79,8 @@ checks = [
     ("src/EditorHooks.cpp", "applying deferred SyncLevel after playtest ended", "0.5.2 deferred sync application missing"),
     ("src/EditorHooks.cpp", "currentMusicTitle", "0.5.2 transmitted cursor music title missing"),
     ("src/EditorHooks.cpp", "Always register it before storing its full serialized state", "0.5.2 StartPos cache hardening missing"),
+    ("src/EditorHooks.cpp", "encodeLayerTaggedUuid", "0.5.3 full/bulk editor-layer sidecar missing"),
+    ("src/EditorHooks.cpp", "objectLayerSyncState", "0.5.3 layer-aware change detection missing"),
     ("src/ActionSerializer.cpp", "StartPos configuration is authoritative shared editor state", "0.5.2 authoritative StartPos serialization missing"),
     ("src/RemoteActionHandler.cpp", "anchor corrected by", "Object Workshop positional correction missing"),
     ("src/RemoteActionHandler.cpp", "Host changed music:", "guest music notification missing"),
@@ -83,6 +93,9 @@ checks = [
     ("src/RemoteActionHandler.cpp", "refusing destructive SyncLevel because serialized object count", "0.5.2 snapshot validation missing"),
     ("src/RemoteActionHandler.cpp", "snapshot mapping incomplete", "0.5.2 robust UUID remapping missing"),
     ("src/RemoteActionHandler.cpp", "loadSettingsFromString(serializedObjects[i])", "0.5.2 StartPos full-sync restoration missing"),
+    ("src/RemoteActionHandler.cpp", "decodeLayerTaggedUuid", "0.5.3 editor-layer sidecar decoder missing"),
+    ("src/RemoteActionHandler.cpp", "applyEditorLayers(match, tagged.editorLayer, tagged.editorLayer2)", "0.5.3 full-sync editor-layer restoration missing"),
+    ("src/RemoteActionHandler.cpp", "|mpedit-editor-layers:", "0.5.3 layer-aware integrity hashing missing"),
     ("src/ui/CursorNode.cpp", "transmittedTitle", "0.5.2 cursor music receiver missing"),
     ("src/ui/MultiplayerPopup.cpp", "MultiplayerPopup::onKick", "host kick UI callback missing"),
     ("src/ui/MultiplayerPopup.cpp", "room-settings-button", "Room Settings button missing"),
@@ -101,6 +114,6 @@ checks = [
 for filename, marker, error in checks:
     text = Path(filename).read_text(encoding="utf-8")
     if marker not in text:
-        raise SystemExit(f"final v6 self-check: {error} ({filename}: {marker})")
+        raise SystemExit(f"final v7 self-check: {error} ({filename}: {marker})")
 
-print("Final v6/0.5.2 self-check passed: hardening, staged connection diagnostics, UI lifetime guards, guest music containment, polished Room Settings and global state are present")
+print("Final v7/0.5.3 self-check passed: editor layers, hardening, staged connection diagnostics, UI lifetime guards, guest music containment, polished Room Settings and global state are present")

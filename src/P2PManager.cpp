@@ -1421,6 +1421,93 @@ namespace mpedit {
 
     void P2PManager::createHostPeer(int clientPlayerId, std::string const& clientName) {
         auto pc = std::make_shared<rtc::PeerConnection>(makeRtcConfig());
+        auto roomCode = getRoomCode();
+        auto offerSent = std::make_shared<bool>(false);
+
+        // Register negotiation callbacks before creating data channels. Creating
+        // the first data channel can immediately trigger negotiation in
+        // libdatachannel; registering these callbacks afterwards can lose the
+        // first local description or early ICE candidates.
+        pc->onLocalCandidate([this, clientPlayerId, roomCode](rtc::Candidate candidate) {
+            auto candidateText = std::string(candidate.candidate());
+            auto candidateMid = std::string(candidate.mid());
+            log::debug(
+                "P2PManager: local ICE candidate host->{} (mid='{}', bytes={})",
+                clientPlayerId,
+                candidateMid,
+                candidateText.size()
+            );
+            auto body = matjson::Value();
+            body["type"] = "candidate";
+            body["candidate"] = candidateText;
+            body["mid"] = candidateMid;
+            body["targetPlayerId"] = clientPlayerId;
+            queueInMainThread([this, roomCode, body]() {
+                sendSignalingMessage(roomCode, body);
+            });
+        });
+
+        pc->onLocalDescription([this, clientPlayerId, roomCode, offerSent](rtc::Description desc) {
+            std::string sdp = std::string(desc);
+            log::info(
+                "P2PManager: Local description set, sending SDP offer for player {} via HTTP (early/trickle)",
+                clientPlayerId
+            );
+
+            queueInMainThread([this, sdp, clientPlayerId, roomCode, offerSent]() {
+                if (*offerSent) return;
+                *offerSent = true;
+                auto body = matjson::Value();
+                body["type"] = "offer";
+                body["sdp"] = sdp;
+                body["targetPlayerId"] = clientPlayerId;
+                sendSignalingMessage(roomCode, body);
+            });
+        });
+
+        pc->onGatheringStateChange([this, pc, clientPlayerId, roomCode, offerSent](
+            rtc::PeerConnection::GatheringState state
+        ) {
+            log::debug(
+                "P2PManager: host ICE gathering state={} player={}",
+                static_cast<int>(state),
+                clientPlayerId
+            );
+            if (state != rtc::PeerConnection::GatheringState::Complete) return;
+
+            auto desc = pc->localDescription();
+            if (!desc.has_value()) return;
+            std::string sdp = std::string(desc.value());
+
+            queueInMainThread([this, sdp, clientPlayerId, roomCode, offerSent]() {
+                if (*offerSent) return;
+                *offerSent = true;
+                log::info(
+                    "P2PManager: ICE gathering complete, sending SDP offer for player {} via HTTP (fallback)",
+                    clientPlayerId
+                );
+                auto body = matjson::Value();
+                body["type"] = "offer";
+                body["sdp"] = sdp;
+                body["targetPlayerId"] = clientPlayerId;
+                sendSignalingMessage(roomCode, body);
+            });
+        });
+
+        pc->onStateChange([this, clientPlayerId](rtc::PeerConnection::State state) {
+            log::info(
+                "P2PManager: host PeerConnection state={} player={}",
+                static_cast<int>(state),
+                clientPlayerId
+            );
+            if (state == rtc::PeerConnection::State::Disconnected ||
+                state == rtc::PeerConnection::State::Failed ||
+                state == rtc::PeerConnection::State::Closed) {
+                queueInMainThread([this, clientPlayerId]() {
+                    onPeerDisconnected(clientPlayerId, true);
+                });
+            }
+        });
 
         auto reliable = pc->createDataChannel("reliable");
 
@@ -1448,16 +1535,21 @@ namespace mpedit {
 
         auto setupChannelCallbacks = [this, clientPlayerId](std::shared_ptr<rtc::DataChannel> dc, bool isReliable) {
             dc->onOpen([this, clientPlayerId, isReliable]() {
-                log::info("P2PManager: {} channel to player {} opened",
-                    isReliable ? "Reliable" : "Unreliable", clientPlayerId);
+                log::info(
+                    "P2PManager: {} channel to player {} opened",
+                    isReliable ? "Reliable" : "Unreliable",
+                    clientPlayerId
+                );
                 checkPeerReady(clientPlayerId);
             });
 
             dc->onMessage([this, clientPlayerId](auto data) {
                 if (auto* binaryMsg = std::get_if<rtc::binary>(&data)) {
-                    onPeerMessage(clientPlayerId,
+                    onPeerMessage(
+                        clientPlayerId,
                         reinterpret_cast<const uint8_t*>(binaryMsg->data()),
-                        binaryMsg->size());
+                        binaryMsg->size()
+                    );
                 }
             });
 
@@ -1469,85 +1561,14 @@ namespace mpedit {
         setupChannelCallbacks(reliable, true);
         setupChannelCallbacks(unreliable, false);
 
-        auto roomCode = getRoomCode();
-
-        auto offerSent = std::make_shared<bool>(false);
-
-        pc->onLocalCandidate([this, clientPlayerId, roomCode](rtc::Candidate candidate) {
-            auto candidateText = std::string(candidate.candidate());
-            auto candidateMid = std::string(candidate.mid());
-            log::debug(
-                "P2PManager: local ICE candidate host->{} (mid='{}', bytes={})",
-                clientPlayerId,
-                candidateMid,
-                candidateText.size()
-            );
-            auto body = matjson::Value();
-            body["type"] = "candidate";
-            body["candidate"] = candidateText;
-            body["mid"] = candidateMid;
-            body["targetPlayerId"] = clientPlayerId;
-            queueInMainThread([this, roomCode, body]() {
-                sendSignalingMessage(roomCode, body);
-            });
-        });
-
-        pc->onLocalDescription([this, clientPlayerId, roomCode, offerSent](rtc::Description desc) {
-            std::string sdp = std::string(desc);
-            log::info("P2PManager: Local description set, sending SDP offer for player {} via HTTP (early/trickle)", clientPlayerId);
-
-            queueInMainThread([this, sdp, clientPlayerId, roomCode, offerSent]() {
-                if (*offerSent) return;
-                *offerSent = true;
-                auto body = matjson::Value();
-                body["type"] = "offer";
-                body["sdp"] = sdp;
-                body["targetPlayerId"] = clientPlayerId;
-                sendSignalingMessage(roomCode, body);
-            });
-        });
-
-        pc->onGatheringStateChange([this, pc, clientPlayerId, roomCode, offerSent](
-            rtc::PeerConnection::GatheringState state)
         {
-            if (state == rtc::PeerConnection::GatheringState::Complete) {
-                auto desc = pc->localDescription();
-                if (desc.has_value()) {
-                    std::string sdp = std::string(desc.value());
+            std::lock_guard lock(m_peersMutex);
+            m_peers[clientPlayerId] = std::move(peer);
+        }
 
-                    queueInMainThread([this, sdp, clientPlayerId, roomCode, offerSent]() {
-                        if (*offerSent) return;
-                        *offerSent = true;
-                        log::info("P2PManager: ICE gathering complete, sending SDP offer for player {} via HTTP (fallback)", clientPlayerId);
-                        auto body = matjson::Value();
-                        body["type"] = "offer";
-                        body["sdp"] = sdp;
-                        body["targetPlayerId"] = clientPlayerId;
-                        sendSignalingMessage(roomCode, body);
-                    });
-                }
-            }
-        });
-
-        pc->onStateChange([this, clientPlayerId](rtc::PeerConnection::State state) {
-            log::info(
-                "P2PManager: host PeerConnection state={} player={}",
-                static_cast<int>(state),
-                clientPlayerId
-            );
-            if (state == rtc::PeerConnection::State::Disconnected ||
-                state == rtc::PeerConnection::State::Failed ||
-                state == rtc::PeerConnection::State::Closed) {
-                queueInMainThread([this, clientPlayerId]() {
-                    onPeerDisconnected(clientPlayerId, true);
-                });
-            }
-        });
-
-        // createDataChannel() may already have triggered offer generation. Calling
-        // setLocalDescription() again in HaveLocalOffer produces a libdatachannel
-        // warning and can race trickle ICE callbacks. Only start negotiation when
-        // the peer is still stable.
+        // createDataChannel() normally starts negotiation automatically. Only
+        // request a local description explicitly when the connection is still
+        // stable, avoiding duplicate HaveLocalOffer transitions.
         if (pc->signalingState() == rtc::PeerConnection::SignalingState::Stable) {
             pc->setLocalDescription();
         } else {
@@ -1555,11 +1576,6 @@ namespace mpedit {
                 "P2PManager: offer already generated for player {}; skipping duplicate setLocalDescription",
                 clientPlayerId
             );
-        }
-
-        {
-            std::lock_guard lock(m_peersMutex);
-            m_peers[clientPlayerId] = std::move(peer);
         }
     }
 

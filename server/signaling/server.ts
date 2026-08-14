@@ -1,0 +1,424 @@
+type SignalMessage = Record<string, unknown>;
+
+type Participant = {
+  playerId: number;
+  playerName: string;
+  token: string;
+  joinedAt: number;
+  lastSeenAt: number;
+  queue: SignalMessage[];
+};
+
+type Room = {
+  roomId: string;
+  roomCode: string;
+  createdAt: number;
+  lastActivityAt: number;
+  generation: number;
+  nextPlayerId: number;
+  host: Participant;
+  clients: Map<number, Participant>;
+  migratedFromHost: boolean;
+};
+
+type RateBucket = {
+  windowStart: number;
+  count: number;
+};
+
+const PORT = 8000;
+const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
+const LONG_POLL_MS = 25_000;
+const MAX_QUEUE_MESSAGES = 128;
+const MAX_PLAYER_NAME = 32;
+const MAX_BODY_BYTES = 128 * 1024;
+const MAX_SDP_BYTES = 64 * 1024;
+const MAX_CANDIDATE_BYTES = 4 * 1024;
+const CREATE_LIMIT_PER_MINUTE = 6;
+const JOIN_LIMIT_PER_MINUTE = 40;
+
+const rooms = new Map<string, Room>();
+const rateBuckets = new Map<string, RateBucket>();
+
+function now(): number {
+  return Date.now();
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function randomHex(bytes: number): string {
+  const data = new Uint8Array(bytes);
+  crypto.getRandomValues(data);
+  return [...data].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function randomRoomCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((value) => alphabet[value % alphabet.length]).join("");
+}
+
+function clientAddress(req: Request): string {
+  return req.headers.get("x-real-ip")
+    ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    ?? "unknown";
+}
+
+function consumeRateLimit(key: string, limit: number): boolean {
+  const current = now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || current - bucket.windowStart >= 60_000) {
+    rateBuckets.set(key, { windowStart: current, count: 1 });
+    return true;
+  }
+  if (bucket.count >= limit) return false;
+  bucket.count += 1;
+  return true;
+}
+
+async function readJson(req: Request): Promise<Record<string, unknown> | null> {
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (declared > MAX_BODY_BYTES) return null;
+
+  const raw = await req.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function bearerToken(req: Request): string {
+  const value = req.headers.get("authorization") ?? "";
+  return value.startsWith("Bearer ") ? value.slice(7).trim() : "";
+}
+
+function sanitizePlayerName(value: unknown): string {
+  if (typeof value !== "string") return "Player";
+  const clean = value.replace(/[\r\n\t]/g, " ").trim().slice(0, MAX_PLAYER_NAME);
+  return clean || "Player";
+}
+
+function findParticipant(room: Room, token: string): Participant | null {
+  if (!token) return null;
+  if (room.host.token === token) return room.host;
+  for (const participant of room.clients.values()) {
+    if (participant.token === token) return participant;
+  }
+  return null;
+}
+
+function touch(room: Room, participant?: Participant | null): void {
+  const current = now();
+  room.lastActivityAt = current;
+  if (participant) participant.lastSeenAt = current;
+}
+
+function enqueue(participant: Participant, message: SignalMessage): void {
+  participant.queue.push(message);
+  if (participant.queue.length > MAX_QUEUE_MESSAGES) {
+    participant.queue.splice(0, participant.queue.length - MAX_QUEUE_MESSAGES);
+  }
+}
+
+function removeExpiredRooms(): void {
+  const cutoff = now() - ROOM_TTL_MS;
+  for (const [code, room] of rooms) {
+    if (room.lastActivityAt < cutoff) rooms.delete(code);
+  }
+
+  const rateCutoff = now() - 5 * 60_000;
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.windowStart < rateCutoff) rateBuckets.delete(key);
+  }
+}
+
+function validateSignal(message: Record<string, unknown>): string | null {
+  const type = typeof message.type === "string" ? message.type : "";
+  if (!["offer", "answer", "candidate"].includes(type)) return "unsupported signal type";
+
+  if ((type === "offer" || type === "answer")) {
+    const sdp = typeof message.sdp === "string" ? message.sdp : "";
+    if (!sdp || new TextEncoder().encode(sdp).byteLength > MAX_SDP_BYTES) {
+      return "invalid SDP";
+    }
+  }
+
+  if (type === "candidate") {
+    const candidate = typeof message.candidate === "string" ? message.candidate : "";
+    const mid = typeof message.mid === "string" ? message.mid : "";
+    if (!candidate || !mid || new TextEncoder().encode(candidate).byteLength > MAX_CANDIDATE_BYTES) {
+      return "invalid ICE candidate";
+    }
+  }
+  return null;
+}
+
+function electMigrationHost(room: Room): Participant | null {
+  const candidates = [...room.clients.values()].sort((a, b) => a.playerId - b.playerId);
+  return candidates[0] ?? null;
+}
+
+function promoteHost(room: Room, winner: Participant): void {
+  room.clients.delete(winner.playerId);
+  room.generation += 1;
+  room.migratedFromHost = true;
+  room.host = {
+    ...winner,
+    playerId: 0,
+    queue: [],
+    lastSeenAt: now(),
+  };
+  room.nextPlayerId = 1;
+
+  // All remaining clients reconnect through /join. Their old records are retained
+  // temporarily only so their existing session token can authenticate /migrate.
+  for (const client of room.clients.values()) {
+    client.queue = [];
+  }
+  touch(room, room.host);
+}
+
+async function longPoll(participant: Participant): Promise<Response> {
+  const deadline = now() + LONG_POLL_MS;
+  while (participant.queue.length === 0 && now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const messages = participant.queue.splice(0, participant.queue.length);
+  return json(messages);
+}
+
+async function handle(req: Request): Promise<Response> {
+  removeExpiredRooms();
+
+  const url = new URL(req.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const parts = path.split("/").filter(Boolean);
+
+  if (req.method === "GET" && path === "/") {
+    return json({
+      ok: true,
+      service: "Multiplayer Edit X signaling",
+      apiVersion: 2,
+      rooms: rooms.size,
+    });
+  }
+
+  if (req.method === "POST" && path === "/rooms") {
+    const ip = clientAddress(req);
+    if (!consumeRateLimit(`create:${ip}`, CREATE_LIMIT_PER_MINUTE)) {
+      return json({ error: "rate limit exceeded" }, 429);
+    }
+
+    const body = await readJson(req);
+    if (!body) return json({ error: "invalid request body" }, 400);
+
+    let roomCode = randomRoomCode();
+    while (rooms.has(roomCode)) roomCode = randomRoomCode();
+
+    const current = now();
+    const host: Participant = {
+      playerId: 0,
+      playerName: sanitizePlayerName(body.playerName),
+      token: randomHex(32),
+      joinedAt: current,
+      lastSeenAt: current,
+      queue: [],
+    };
+    const room: Room = {
+      roomId: randomHex(16),
+      roomCode,
+      createdAt: current,
+      lastActivityAt: current,
+      generation: 1,
+      nextPlayerId: 1,
+      host,
+      clients: new Map(),
+      migratedFromHost: false,
+    };
+    rooms.set(roomCode, room);
+
+    return json({
+      roomCode,
+      roomId: room.roomId,
+      playerId: 0,
+      sessionToken: host.token,
+      generation: room.generation,
+      signalingApi: 2,
+    }, 201);
+  }
+
+  if (parts.length >= 2 && parts[0] === "rooms") {
+    const roomCode = parts[1].toUpperCase();
+    const room = rooms.get(roomCode);
+    if (!room) return json({ error: "room not found" }, 404);
+
+    if (req.method === "POST" && parts.length === 3 && parts[2] === "join") {
+      const ip = clientAddress(req);
+      if (!consumeRateLimit(`join:${ip}`, JOIN_LIMIT_PER_MINUTE)) {
+        return json({ error: "rate limit exceeded" }, 429);
+      }
+
+      const body = await readJson(req);
+      if (!body) return json({ error: "invalid request body" }, 400);
+
+      const playerId = room.nextPlayerId++;
+      const current = now();
+      const participant: Participant = {
+        playerId,
+        playerName: sanitizePlayerName(body.playerName),
+        token: randomHex(32),
+        joinedAt: current,
+        lastSeenAt: current,
+        queue: [],
+      };
+      room.clients.set(playerId, participant);
+      touch(room, participant);
+
+      enqueue(room.host, {
+        type: "client_joined",
+        playerId,
+        playerName: participant.playerName,
+        generation: room.generation,
+      });
+
+      return json({
+        playerId,
+        hostName: room.host.playerName,
+        hostPlayerId: 0,
+        sessionToken: participant.token,
+        generation: room.generation,
+        signalingApi: 2,
+      });
+    }
+
+    if (req.method === "POST" && parts.length === 3 && parts[2] === "migrate") {
+      const token = bearerToken(req);
+      const requester = findParticipant(room, token);
+      if (!requester) return json({ error: "unauthorized" }, 401);
+
+      // If the requester is already the current host, migration has completed.
+      if (requester.token === room.host.token && requester.playerId === 0 && room.migratedFromHost) {
+        touch(room, requester);
+        return json({
+          role: "host",
+          playerId: 0,
+          sessionToken: room.host.token,
+          generation: room.generation,
+        });
+      }
+
+      if (!room.migratedFromHost) {
+        const winner = electMigrationHost(room);
+        if (!winner) {
+          rooms.delete(roomCode);
+          return json({ error: "no migration candidate" }, 410);
+        }
+        promoteHost(room, winner);
+      }
+
+      const current = findParticipant(room, token);
+      if (current && current.token === room.host.token) {
+        return json({
+          role: "host",
+          playerId: 0,
+          sessionToken: room.host.token,
+          generation: room.generation,
+        });
+      }
+
+      return json({
+        role: "client",
+        generation: room.generation,
+        retryAfterMs: 350,
+      });
+    }
+
+    if (req.method === "GET" && parts.length === 3 && parts[2] === "signal") {
+      const token = bearerToken(req);
+      const participant = findParticipant(room, token);
+      if (!participant) return json({ error: "unauthorized" }, 401);
+
+      const requestedRole = url.searchParams.get("role") ?? "";
+      if (requestedRole === "host" && participant.token !== room.host.token) {
+        return json({ error: "host token required" }, 403);
+      }
+      if (requestedRole === "client" && participant.token === room.host.token) {
+        return json({ error: "client token required" }, 403);
+      }
+
+      touch(room, participant);
+      return await longPoll(participant);
+    }
+
+    if (req.method === "POST" && parts.length === 3 && parts[2] === "signal") {
+      const token = bearerToken(req);
+      const sender = findParticipant(room, token);
+      if (!sender) return json({ error: "unauthorized" }, 401);
+
+      const message = await readJson(req);
+      if (!message) return json({ error: "invalid request body" }, 400);
+      const validationError = validateSignal(message);
+      if (validationError) return json({ error: validationError }, 400);
+
+      const type = message.type as string;
+      const isHost = sender.token === room.host.token;
+
+      if (isHost) {
+        const targetId = Number(message.targetPlayerId ?? -1);
+        const target = room.clients.get(targetId);
+        if (!target) return json({ error: "target client not found" }, 404);
+        enqueue(target, { ...message, generation: room.generation });
+      } else {
+        const normalized = { ...message, playerId: sender.playerId, generation: room.generation };
+        enqueue(room.host, normalized);
+      }
+
+      touch(room, sender);
+      return json({ ok: true });
+    }
+
+    if (req.method === "DELETE" && parts.length === 2) {
+      const token = bearerToken(req);
+      if (!token || token !== room.host.token) return json({ error: "host token required" }, 403);
+
+      const winner = electMigrationHost(room);
+      if (!winner) {
+        rooms.delete(roomCode);
+        return json({ ok: true, closed: true });
+      }
+
+      promoteHost(room, winner);
+      return json({
+        ok: true,
+        closed: false,
+        migrated: true,
+        generation: room.generation,
+      });
+    }
+  }
+
+  return json({ error: "not found" }, 404);
+}
+
+Deno.serve({ hostname: "127.0.0.1", port: PORT }, async (req) => {
+  try {
+    return await handle(req);
+  } catch (error) {
+    console.error("signaling request failed", error);
+    return json({ error: "internal server error" }, 500);
+  }
+});

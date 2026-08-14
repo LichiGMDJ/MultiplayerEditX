@@ -28,7 +28,7 @@ jobs:
         run: |
           git config user.name "LichiGMDJ"
           git config user.email "aleksandrrubacev222@gmail.com"
-          git add src server .github/workflows/multi-platform-release.yml
+          git add src server
           git diff --cached --quiet && exit 0
           git commit -m "feat: restore room browser, privacy and passwords"
           git push origin HEAD:v053-room-browser

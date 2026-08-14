@@ -1,0 +1,39 @@
+name: Run v0.5.3 architecture migration
+
+on:
+  push:
+    branches:
+      - mod-id-lichigmdj
+    paths:
+      - .github/workflows/v053-run-upgrade.yml
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply migration
+        run: python3 tools/v053_upgrade.py
+
+      - name: Validate source tree
+        run: |
+          grep -q 'kCurrentProtocol = 8' src/net/ProtocolCapabilities.hpp
+          grep -q 'requestHostMigration' src/P2PManager.cpp
+          grep -q 'AdaptiveSyncPolicy' src/EditorHooks.cpp
+          grep -q 'sessionToken' server/signaling/server.ts
+          if grep -q '194.226.126.115' src/P2PManager.cpp; then exit 1; fi
+
+      - name: Commit
+        run: |
+          git config user.name 'LichiGMDJ'
+          git config user.email 'aleksandrrubacev222@gmail.com'
+          git add -A
+          git commit -m 'Integrate v0.5.3 universal networking architecture'
+          git push origin HEAD:mod-id-lichigmdj

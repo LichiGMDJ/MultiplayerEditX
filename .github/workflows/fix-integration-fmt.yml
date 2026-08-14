@@ -1,0 +1,33 @@
+name: Fix Integration Fmt Compile
+
+on:
+  push:
+    branches:
+      - v053-upstream050-integration
+    paths:
+      - tools/fix-integration-fmt.trigger
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v053-upstream050-integration
+          fetch-depth: 0
+      - name: Apply fmt logger fix
+        run: python3 tools/fix_integration_fmt.py
+      - name: Verify source
+        run: |
+          grep -q 'stable WebRTC path failed; retrying through configured TURN/UDP' src/P2PManager.cpp
+          git diff --check
+      - name: Commit source fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/P2PManager.cpp
+          git commit -m 'fix: use compile-time logging strings for transport selection' || exit 0
+          git push origin v053-upstream050-integration

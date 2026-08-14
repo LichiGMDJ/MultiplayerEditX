@@ -1,6 +1,7 @@
 #include "MultiplayerPopup.hpp"
 #include "UpdateHelperNode.hpp"
 #include "RoomSettingsPopup.hpp"
+#include "RoomDiscoveryPopups.hpp"
 #include "../SessionManager.hpp"
 #include "../P2PManager.hpp"
 #include <Geode/Geode.hpp>
@@ -74,84 +75,71 @@ namespace mpedit {
         auto center = m_mainLayer->getContentSize() / 2.f;
         bool inEditor = LevelEditorLayer::get() != nullptr;
 
-        // Player name is fetched automatically from account
         std::string accountName = GJAccountManager::sharedState()->m_username;
-        if (accountName.empty()) {
-            accountName = "Player";
-        }
+        if (accountName.empty()) accountName = "Player";
         Mod::get()->setSettingValue<std::string>("player-name", accountName);
 
         m_connectMenu = CCMenu::create();
-        m_connectMenu->setPosition({0, 0});
+        m_connectMenu->setPosition({0.f, 0.f});
         m_connectMenu->setID("connect-menu"_spr);
 
-        if (!inEditor) {
-            // Room code input
-            auto* codeLabel = CCLabelBMFont::create("Room Code:", "bigFont.fnt");
-            codeLabel->setScale(0.4f);
-            codeLabel->setPosition({center.width, center.height + 10.f});
-            codeLabel->setID("code-label"_spr);
-            m_contentNode->addChild(codeLabel);
+        auto* serverLabel = CCLabelBMFont::create(P2PManager::getSignalingUrl().c_str(), "chatFont.fnt");
+        serverLabel->setScale(0.27f);
+        serverLabel->setPosition({center.width, center.height + 78.f});
+        serverLabel->setColor({165, 165, 165});
+        m_contentNode->addChild(serverLabel);
 
-            auto* inputBg = cocos2d::extension::CCScale9Sprite::create("square02_small.png");
-            inputBg->setContentSize({200.f, 30.f});
-            inputBg->setPosition({center.width, center.height - 15.f});
-            inputBg->setOpacity(100);
-            m_contentNode->addChild(inputBg);
+        if (inEditor) {
+            auto* hint = CCLabelBMFont::create("Host this level on the selected signaling server", "chatFont.fnt");
+            hint->setScale(0.34f);
+            hint->setPosition({center.width, center.height + 35.f});
+            m_contentNode->addChild(hint);
 
-            m_roomCodeInput = TextInput::create(200.f, "Enter room code...", "chatFont.fnt");
-            m_roomCodeInput->setPosition({center.width, center.height - 15.f});
-            m_roomCodeInput->setID("code-input"_spr);
-            m_roomCodeInput->setCommonFilter(CommonFilter::Alphanumeric);
-            m_contentNode->addChild(m_roomCodeInput);
-
-            // Join button
-            auto* joinSprite = ButtonSprite::create(
-                "Join", 100, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.7f
+            auto* createSprite = ButtonSprite::create(
+                "Create Room", 140, true, "bigFont.fnt", "GJ_button_02.png", 30.f, 0.62f
             );
-            auto* joinBtn = CCMenuItemSpriteExtra::create(
-                joinSprite, this, menu_selector(MultiplayerPopup::onJoin)
+            auto* createBtn = CCMenuItemSpriteExtra::create(
+                createSprite, this, menu_selector(MultiplayerPopup::onHost)
             );
-            joinBtn->setPosition({center.width, center.height - 60.f});
-            joinBtn->setID("join-button"_spr);
-            m_connectMenu->addChild(joinBtn);
+            createBtn->setPosition({center.width, center.height - 12.f});
+            createBtn->setID("create-room-button"_spr);
+            m_connectMenu->addChild(createBtn);
         } else {
-            // Host button
-            auto* hostSprite = ButtonSprite::create(
-                "Host", 100, true, "bigFont.fnt", "GJ_button_02.png", 30.f, 0.7f
+            auto* browseSprite = ButtonSprite::create(
+                "Public Rooms", 135, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.58f
             );
-            auto* hostBtn = CCMenuItemSpriteExtra::create(
-                hostSprite, this, menu_selector(MultiplayerPopup::onHost)
+            auto* browseBtn = CCMenuItemSpriteExtra::create(
+                browseSprite, this, menu_selector(MultiplayerPopup::onBrowsePublic)
             );
-            hostBtn->setPosition({center.width, center.height - 15.f});
-            hostBtn->setID("host-button"_spr);
-            m_connectMenu->addChild(hostBtn);
+            browseBtn->setPosition({center.width - 72.f, center.height + 10.f});
+            browseBtn->setID("public-rooms-button"_spr);
+            m_connectMenu->addChild(browseBtn);
+
+            auto* privateSprite = ButtonSprite::create(
+                "Private Room", 135, true, "bigFont.fnt", "GJ_button_05.png", 30.f, 0.58f
+            );
+            auto* privateBtn = CCMenuItemSpriteExtra::create(
+                privateSprite, this, menu_selector(MultiplayerPopup::onPrivateRoom)
+            );
+            privateBtn->setPosition({center.width + 72.f, center.height + 10.f});
+            privateBtn->setID("private-room-button"_spr);
+            m_connectMenu->addChild(privateBtn);
+
+            auto* hint = CCLabelBMFont::create(
+                "Public rooms are discovered from the Signaling Server URL in mod settings",
+                "chatFont.fnt"
+            );
+            hint->setScale(0.29f);
+            hint->setPosition({center.width, center.height - 38.f});
+            hint->setColor({185, 185, 185});
+            m_contentNode->addChild(hint);
         }
-
-        // Patreon Support Section
-        auto* supportLabel = CCLabelBMFont::create("Support future development:", "chatFont.fnt");
-        supportLabel->setScale(0.5f);
-        supportLabel->setPosition({center.width, center.height + 85.f});
-        supportLabel->setColor({200, 200, 200});
-        supportLabel->setID("support-label"_spr);
-        m_contentNode->addChild(supportLabel);
-
-        auto* patreonSprite = ButtonSprite::create(
-            "Patreon", 80, true, "bigFont.fnt", "GJ_button_01.png", 25.f, 0.6f
-        );
-        auto* patreonBtn = CCMenuItemSpriteExtra::create(
-            patreonSprite, this, menu_selector(MultiplayerPopup::onPatreon)
-        );
-        patreonBtn->setPosition({center.width, center.height + 55.f});
-        patreonBtn->setID("patreon-button"_spr);
-        m_connectMenu->addChild(patreonBtn);
 
         m_contentNode->addChild(m_connectMenu);
 
-        // Status label
         m_statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_statusLabel->setScale(0.6f);
-        m_statusLabel->setPosition({center.width, center.height - 95.f});
+        m_statusLabel->setScale(0.55f);
+        m_statusLabel->setPosition({center.width, center.height - 88.f});
         m_statusLabel->setID("status-label"_spr);
         m_statusLabel->setColor({200, 200, 200});
         m_contentNode->addChild(m_statusLabel);
@@ -346,69 +334,84 @@ namespace mpedit {
     }
 
     void MultiplayerPopup::onHost(CCObject*) {
+        if (!LevelEditorLayer::get()) return;
+        if (auto* popup = CreateRoomPopup::create(this)) popup->show();
+    }
+
+    void MultiplayerPopup::onBrowsePublic(CCObject*) {
+        if (auto* popup = RoomBrowserPopup::create(this)) popup->show();
+    }
+
+    void MultiplayerPopup::onPrivateRoom(CCObject*) {
+        if (auto* popup = PrivateRoomPopup::create(this)) popup->show();
+    }
+
+    void MultiplayerPopup::beginHost(
+        std::string const& roomName,
+        std::string const& description,
+        int playerLimit,
+        bool isPrivate,
+        std::string const& password
+    ) {
         std::string name = GJAccountManager::sharedState()->m_username;
         if (name.empty()) name = "Player";
         Mod::get()->setSettingValue<std::string>("player-name", name);
 
         if (m_statusLabel) {
-            m_statusLabel->setString("Connecting...");
+            m_statusLabel->setString("Creating room...");
             m_statusLabel->setColor({255, 255, 100});
         }
 
         auto& session = SessionManager::get();
-        
         session.onSessionStarted([this]() {
-            auto& session = SessionManager::get();
-            if (session.getRole() == SessionManager::Role::Client) {
+            auto& current = SessionManager::get();
+            if (current.getRole() == SessionManager::Role::Client) {
                 createLoadingView("Waiting for level sync from host...");
             } else {
                 this->clearContentNode();
                 createSessionView();
-                Notification::create("Session started!", NotificationIcon::Success)->show();
+                Notification::create("Room created!", NotificationIcon::Success)->show();
             }
         });
-
         session.onError([this](std::string const& error) {
             auto& net = P2PManager::get();
             std::string fullError = error;
             if (net.getState() == P2PManager::State::Error) {
-                fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());
+                fullError = fmt::format("{}
+
+Network: {}", error, net.getError());
             }
-            
             m_connectionPending = false;
             m_connectionElapsed = 0.f;
             m_lastConnectionStage = -1;
             this->clearContentNode();
             this->createConnectView();
-            
             if (m_statusLabel) {
                 m_statusLabel->setString(error.c_str());
                 m_statusLabel->setColor({255, 100, 100});
             }
-            
             log::error("MultiplayerPopup: Session error - {}", fullError);
             FLAlertLayer::create("Connection Error", fullError.c_str(), "OK")->show();
         });
 
-        session.hostSession(name);
+        session.hostSession(name, roomName, description, playerLimit, isPrivate, password);
     }
 
     void MultiplayerPopup::onJoin(CCObject*) {
         if (!m_roomCodeInput) return;
+        beginJoin(std::string(m_roomCodeInput->getString()), "");
+    }
+
+    void MultiplayerPopup::beginJoin(std::string const& roomCode, std::string const& password) {
         std::string name = GJAccountManager::sharedState()->m_username;
         if (name.empty()) name = "Player";
-        std::string code = std::string(m_roomCodeInput->getString());
-
+        std::string code = roomCode;
         if (code.empty()) {
-            if (m_statusLabel) {
-                m_statusLabel->setString("Please enter a room code!");
-                m_statusLabel->setColor({255, 100, 100});
-            }
+            Notification::create("Please enter a room code", NotificationIcon::Error)->show();
             return;
         }
 
         Mod::get()->setSettingValue<std::string>("player-name", name);
-
         m_connectionPending = true;
         m_connectionElapsed = 0.f;
         m_lastConnectionStage = -1;
@@ -418,33 +421,30 @@ namespace mpedit {
         }
 
         auto& session = SessionManager::get();
-
         session.onSessionStarted([this]() {
-            createLoadingView("Stage 2/4: Negotiating WebRTC / ICE...");
+            createLoadingView("Stage 2/4: Negotiating selected transport...");
             m_connectionPending = true;
             m_lastConnectionStage = 2;
         });
-
         session.onError([this](std::string const& error) {
             auto& net = P2PManager::get();
             std::string fullError = error;
             if (net.getState() == P2PManager::State::Error) {
-                fullError = fmt::format("{}\n\nNetwork: {}", error, net.getError());
+                fullError = fmt::format("{}
+
+Network: {}", error, net.getError());
             }
-            
+            m_connectionPending = false;
             this->clearContentNode();
             this->createConnectView();
-            
             if (m_statusLabel) {
                 m_statusLabel->setString(error.c_str());
                 m_statusLabel->setColor({255, 100, 100});
             }
-            
             log::error("MultiplayerPopup: Session error - {}", fullError);
             FLAlertLayer::create("Connection Error", fullError.c_str(), "OK")->show();
         });
-
-        session.joinSession(code, name);
+        session.joinSession(code, name, password);
     }
 
     void MultiplayerPopup::onLeave(CCObject*) {
@@ -510,9 +510,6 @@ namespace mpedit {
         Notification::create("Player kicked", NotificationIcon::Info)->show();
     }
 
-    void MultiplayerPopup::onPatreon(CCObject*) {
-        geode::utils::web::openLinkInBrowser("https://www.patreon.com/cw/d050/membership");
-    }
 
     void MultiplayerPopup::pollNetwork(float dt) {
         auto& net = P2PManager::get();

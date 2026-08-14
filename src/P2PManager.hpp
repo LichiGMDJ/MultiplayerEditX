@@ -56,8 +56,19 @@ namespace mpedit {
         static P2PManager& get();
 
 
-        void hostSession(std::string const& playerName);
-        void joinSession(std::string const& roomCode, std::string const& playerName);
+        void hostSession(
+            std::string const& playerName,
+            std::string const& roomName = "",
+            std::string const& description = "",
+            int playerLimit = 8,
+            bool isPrivate = false,
+            std::string const& password = ""
+        );
+        void joinSession(
+            std::string const& roomCode,
+            std::string const& playerName,
+            std::string const& password = ""
+        );
         void leaveSession();
 
 
@@ -208,6 +219,12 @@ namespace mpedit {
         int m_localPlayerId = -1;
         std::string m_localPlayerName;
         std::string m_error;
+        std::string m_pendingRoomName;
+        std::string m_pendingRoomDescription;
+        std::string m_pendingRoomPassword;
+        std::string m_pendingJoinPassword;
+        int m_pendingPlayerLimit = 8;
+        bool m_pendingRoomPrivate = false;
         mutable std::mutex m_stateMutex;
 
 

@@ -25,6 +25,11 @@ type Room = {
   lastActivityAt: number;
   generation: number;
   nextPlayerId: number;
+  roomName: string;
+  description: string;
+  playerLimit: number;
+  isPrivate: boolean;
+  password: string;
   host: Participant;
   clients: Map<number, Participant>;
 };
@@ -128,6 +133,22 @@ function sanitizeTransportMode(value: unknown): string {
   const normalized = value.trim().toLowerCase();
   if (["auto", "webrtc", "turn", "http-relay"].includes(normalized)) return normalized;
   return "auto";
+}
+
+function sanitizeRoomText(value: unknown, maxLength: number, fallback = ""): string {
+  if (typeof value !== "string") return fallback;
+  const clean = value.replace(/[\r\n\t]/g, " ").trim().slice(0, maxLength);
+  return clean || fallback;
+}
+
+function sanitizePlayerLimit(value: unknown): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 8;
+  return Math.max(2, Math.min(16, Math.trunc(numeric)));
+}
+
+function sanitizePassword(value: unknown): string {
+  return typeof value === "string" ? value.slice(0, 48) : "";
 }
 
 function findParticipant(room: Room, token: string): Participant | null {
@@ -258,6 +279,25 @@ async function handle(req: Request): Promise<Response> {
     });
   }
 
+  if (req.method === "GET" && path === "/rooms") {
+    const publicRooms = [...rooms.values()]
+      .filter((room) => !room.isPrivate)
+      .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+      .slice(0, 100)
+      .map((room) => ({
+        roomCode: room.roomCode,
+        roomName: room.roomName,
+        description: room.description,
+        hostName: room.host.playerName,
+        playerCount: room.clients.size + 1,
+        playerLimit: room.playerLimit,
+        hasPassword: room.password.length > 0,
+        transportMode: room.host.transportMode,
+        createdAt: room.createdAt,
+      }));
+    return json(publicRooms);
+  }
+
   if (req.method === "POST" && path === "/rooms") {
     const ip = clientAddress(req);
     if (!consumeRateLimit(`create:${ip}`, CREATE_LIMIT_PER_MINUTE)) {
@@ -289,6 +329,11 @@ async function handle(req: Request): Promise<Response> {
       lastActivityAt: current,
       generation: 1,
       nextPlayerId: 1,
+      roomName: sanitizeRoomText(body.roomName, 32, `${host.playerName}'s Room`),
+      description: sanitizeRoomText(body.description, 64),
+      playerLimit: sanitizePlayerLimit(body.playerLimit),
+      isPrivate: body.isPrivate === true,
+      password: sanitizePassword(body.password),
       host,
       clients: new Map(),
     };
@@ -303,6 +348,10 @@ async function handle(req: Request): Promise<Response> {
       signalingApi: 2,
       relayApi: 1,
       hostTransportMode: host.transportMode,
+      roomName: room.roomName,
+      isPrivate: room.isPrivate,
+      hasPassword: room.password.length > 0,
+      playerLimit: room.playerLimit,
     }, 201);
   }
 
@@ -320,14 +369,19 @@ async function handle(req: Request): Promise<Response> {
       const body = await readJson(req);
       if (!body) return json({ error: "invalid request body" }, 400);
 
+      if (room.password.length > 0 && sanitizePassword(body.password) !== room.password) {
+        return json({ error: "invalid room password", passwordRequired: true }, 403);
+      }
+
       const previousToken = bearerToken(req);
       const previous = findParticipant(room, previousToken);
       if (previous && previous.token !== room.host.token) {
         room.clients.delete(previous.playerId);
       }
 
-      // Hard server-side safety cap. Room Settings may enforce a lower limit.
-      if (room.clients.size >= 31) {
+      // Directory-level capacity is enforced before signaling/WebRTC setup.
+      // Protocol Room Settings still apply host-side permissions after handshake.
+      if (room.clients.size + 1 >= room.playerLimit) {
         return json({ error: "room capacity reached" }, 429);
       }
 
@@ -364,6 +418,9 @@ async function handle(req: Request): Promise<Response> {
         signalingApi: 2,
         relayApi: 1,
         hostTransportMode: room.host.transportMode,
+        roomName: room.roomName,
+        hasPassword: room.password.length > 0,
+        playerLimit: room.playerLimit,
       });
     }
 

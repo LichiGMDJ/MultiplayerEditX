@@ -1027,7 +1027,14 @@ namespace mpedit {
 
 
 
-    void P2PManager::hostSession(std::string const& playerName) {
+    void P2PManager::hostSession(
+        std::string const& playerName,
+        std::string const& roomName,
+        std::string const& description,
+        int playerLimit,
+        bool isPrivate,
+        std::string const& password
+    ) {
         auto selectedNetwork = net::NetworkConfig::load();
         if (selectedNetwork.connectionMode == net::ConnectionMode::Turn && !selectedNetwork.hasTurn()) {
             m_state.store(State::Error);
@@ -1042,11 +1049,18 @@ namespace mpedit {
             m_localPlayerName = playerName;
             m_error.clear();
         }
+        m_pendingRoomName = roomName.empty() ? (playerName + "'s Room") : roomName;
+        m_pendingRoomDescription = description;
+        m_pendingRoomPassword = password;
+        m_pendingPlayerLimit = std::clamp(playerLimit, 2, 16);
+        m_pendingRoomPrivate = isPrivate;
+
         m_state.store(State::Connecting);
         m_nextPlayerId = 1;
         {
             std::lock_guard lock(m_roomSettingsMutex);
             m_roomSettings = RoomSettings{};
+            m_roomSettings.maxPlayers = static_cast<uint32_t>(m_pendingPlayerLimit);
         }
         m_globalRevision.store(0);
         m_lastGlobalAuthor.store(0);
@@ -1066,6 +1080,11 @@ namespace mpedit {
         body["protocol"] = static_cast<int>(net::kCurrentProtocol);
         body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
         body["transportMode"] = net::NetworkConfig::load().transportModeName();
+        body["roomName"] = m_pendingRoomName;
+        body["description"] = m_pendingRoomDescription;
+        body["playerLimit"] = m_pendingPlayerLimit;
+        body["isPrivate"] = m_pendingRoomPrivate;
+        body["password"] = m_pendingRoomPassword;
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -1341,7 +1360,11 @@ namespace mpedit {
 
 
 
-    void P2PManager::joinSession(std::string const& roomCode, std::string const& playerName) {
+    void P2PManager::joinSession(
+        std::string const& roomCode,
+        std::string const& playerName,
+        std::string const& password
+    ) {
         auto selectedNetwork = net::NetworkConfig::load();
         if (selectedNetwork.connectionMode == net::ConnectionMode::Turn && !selectedNetwork.hasTurn()) {
             m_state.store(State::Error);
@@ -1356,6 +1379,7 @@ namespace mpedit {
             m_localPlayerName = playerName;
             m_error.clear();
         }
+        m_pendingJoinPassword = password;
         m_state.store(State::Connecting);
         m_globalRevision.store(0);
         m_lastGlobalAuthor.store(0);
@@ -1378,6 +1402,7 @@ namespace mpedit {
         body["protocol"] = static_cast<int>(net::kCurrentProtocol);
         body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
         body["transportMode"] = net::NetworkConfig::load().transportModeName();
+        body["password"] = m_pendingJoinPassword;
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -2294,6 +2319,12 @@ namespace mpedit {
         m_signalingToken.clear();
         m_signalingGeneration = 0;
         m_signalingApi = 1;
+        m_pendingRoomName.clear();
+        m_pendingRoomDescription.clear();
+        m_pendingRoomPassword.clear();
+        m_pendingJoinPassword.clear();
+        m_pendingPlayerLimit = 8;
+        m_pendingRoomPrivate = false;
         m_hostMigrationAvailable.store(false);
 
         log::info("P2PManager: Session ended");

@@ -26,8 +26,19 @@ namespace mpedit {
         static SessionManager& get();
 
         // Session lifecycle
-        void hostSession(std::string const& playerName);
-        void joinSession(std::string const& roomCode, std::string const& playerName);
+        void hostSession(
+            std::string const& playerName,
+            std::string const& roomName = "",
+            std::string const& description = "",
+            int playerLimit = 8,
+            bool isPrivate = false,
+            std::string const& password = ""
+        );
+        void joinSession(
+            std::string const& roomCode,
+            std::string const& playerName,
+            std::string const& password = ""
+        );
         void leaveSession();
 
         // State queries

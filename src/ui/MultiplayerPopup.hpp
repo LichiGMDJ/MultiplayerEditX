@@ -31,16 +31,25 @@ namespace mpedit {
 
         void onHost(cocos2d::CCObject*);
         void onJoin(cocos2d::CCObject*);
+        void onBrowsePublic(cocos2d::CCObject*);
+        void onPrivateRoom(cocos2d::CCObject*);
         void onLeave(cocos2d::CCObject*);
         void onCopyCode(cocos2d::CCObject*);
         void onKick(cocos2d::CCObject*);
         void onRoomSettings(cocos2d::CCObject*);
-        void onPatreon(cocos2d::CCObject*);
         void pollNetwork(float dt);
 
     public:
         static inline MultiplayerPopup* s_instance = nullptr;
         static MultiplayerPopup* create();
+        void beginHost(
+            std::string const& roomName,
+            std::string const& description,
+            int playerLimit,
+            bool isPrivate,
+            std::string const& password
+        );
+        void beginJoin(std::string const& roomCode, std::string const& password);
         void forceClose() {
             this->onClose(nullptr);
         }

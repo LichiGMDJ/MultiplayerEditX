@@ -16,7 +16,14 @@ namespace mpedit {
         return instance;
     }
 
-    void SessionManager::hostSession(std::string const& playerName) {
+    void SessionManager::hostSession(
+        std::string const& playerName,
+        std::string const& roomName,
+        std::string const& description,
+        int playerLimit,
+        bool isPrivate,
+        std::string const& password
+    ) {
         if (isInSession()) {
             log::warn("SessionManager: Already in a session");
             return;
@@ -26,12 +33,16 @@ namespace mpedit {
         m_role = Role::Host;
 
         setupNetworkHandlers();
-        P2PManager::get().hostSession(playerName);
+        P2PManager::get().hostSession(playerName, roomName, description, playerLimit, isPrivate, password);
 
         log::info("SessionManager: Hosting session as '{}'", playerName);
     }
 
-    void SessionManager::joinSession(std::string const& roomCode, std::string const& playerName) {
+    void SessionManager::joinSession(
+        std::string const& roomCode,
+        std::string const& playerName,
+        std::string const& password
+    ) {
         if (isInSession()) {
             log::warn("SessionManager: Already in a session");
             return;
@@ -42,7 +53,7 @@ namespace mpedit {
         m_role = Role::Client;
 
         setupNetworkHandlers();
-        P2PManager::get().joinSession(roomCode, playerName);
+        P2PManager::get().joinSession(roomCode, playerName, password);
 
         log::info("SessionManager: Joining room '{}' as '{}'", roomCode, playerName);
     }

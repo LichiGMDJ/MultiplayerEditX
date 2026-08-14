@@ -18,8 +18,8 @@ jobs:
           ref: v053-stable-baseline
           fetch-depth: 0
       - name: Patch stable P2P connection configuration
-        shell: python
         run: |
+          python - <<'PY'
           from pathlib import Path
 
           path = Path('src/P2PManager.cpp')
@@ -89,6 +89,7 @@ jobs:
               raise SystemExit('stable makeRtcConfig/getSignalingUrl block not found')
 
           path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Validate adapter
         run: |
           grep -q 'stable 0.5.0 direct/STUN ICE path' src/P2PManager.cpp

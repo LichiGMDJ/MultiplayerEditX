@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BinaryProtocol.hpp"
+#include "net/ProtocolCapabilities.hpp"
 #include <Geode/utils/web.hpp>
 #include <Geode/utils/async.hpp>
 #include <string>
@@ -67,6 +68,8 @@ namespace mpedit {
         int getLocalPlayerId() const;
         std::string getError() const;
         bool isPeerReconnect(int playerId);
+        bool supportsCapability(int playerId, net::Capability capability);
+        std::size_t getTotalReliableQueueDepth();
         uint32_t getGlobalRevision() const { return m_globalRevision.load(); }
         int getLastGlobalAuthor() const { return m_lastGlobalAuthor.load(); }
         struct RoomSettings {
@@ -142,6 +145,7 @@ namespace mpedit {
             bool ready = false; // both channels open
             bool protocolVerified = false;
             uint32_t protocolVersion = 0;
+            uint64_t capabilities = 0;
             std::vector<std::vector<uint8_t>> preHandshakeMessages;
             std::vector<PendingMessage> pendingMessages;
             std::vector<std::vector<uint8_t>> bulkReliableQueue;
@@ -177,6 +181,8 @@ namespace mpedit {
 
         void relayMessage(int fromPlayerId, const uint8_t* data, size_t len, ChannelType channel);
         void flushBulkReliableQueues();
+        void requestHostMigration();
+        void becomeMigratedHost(std::string const& token, uint32_t generation);
         void scheduleClientReconnect();
         void finalizePeerHandshake(int playerId);
         void checkPeerReady(int playerId);
@@ -224,8 +230,13 @@ namespace mpedit {
 
         geode::async::TaskHolder<geode::utils::web::WebResponse> m_signalingListener;  // room create/join
         geode::async::TaskHolder<geode::utils::web::WebResponse> m_signalPollListener; // long-poll loop
+        geode::async::TaskHolder<geode::utils::web::WebResponse> m_migrationListener;
         std::atomic<bool> m_signalingActive{false};
+        std::atomic<bool> m_hostMigrationAvailable{false};
         std::string m_signalingRoomId;   // server-side room ID
+        std::string m_signalingToken;
+        uint32_t m_signalingGeneration = 0;
+        uint32_t m_signalingApi = 1;
 
 
     };

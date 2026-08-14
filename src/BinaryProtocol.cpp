@@ -325,10 +325,12 @@ namespace mpedit::proto {
         return std::move(w.takeData());
     }
 
-    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion) {
+    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion, uint64_t capabilities) {
         Writer w;
         w.writeOpcode(Opcode::ProtocolHello);
         w.writeVarInt(protocolVersion);
+        w.writeU32(static_cast<uint32_t>(capabilities & 0xffffffffull));
+        w.writeU32(static_cast<uint32_t>(capabilities >> 32));
         return std::move(w.takeData());
     }
 
@@ -649,6 +651,11 @@ namespace mpedit::proto {
     ProtocolHelloMsg deserializeProtocolHello(Reader& r) {
         ProtocolHelloMsg msg;
         msg.protocolVersion = r.readVarInt();
+        if (r.remaining() >= 8) {
+            uint64_t low = r.readU32();
+            uint64_t high = r.readU32();
+            msg.capabilities = low | (high << 32);
+        }
         return msg;
     }
 

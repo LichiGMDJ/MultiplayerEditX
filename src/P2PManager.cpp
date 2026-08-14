@@ -1,5 +1,8 @@
 #include "P2PManager.hpp"
 #include "BinaryProtocol.hpp"
+#include "net/NetworkConfig.hpp"
+#include "net/ProtocolCapabilities.hpp"
+#include "sync/SyncMetrics.hpp"
 
 #include <rtc/rtc.hpp>
 #include <Geode/Geode.hpp>
@@ -12,8 +15,6 @@ using namespace geode::prelude;
 namespace mpedit {
 
     namespace {
-        constexpr uint32_t kProtocolVersion = 7;
-
         uint64_t reliabilityNowMs() {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()
@@ -53,46 +54,29 @@ namespace mpedit {
         rtc::Configuration config;
         config.iceServers.push_back({"stun:stun.l.google.com:19302"});
         config.iceServers.push_back({"stun:stun.cloudflare.com:3478"});
-        auto turnHost = Mod::get()->getSettingValue<std::string>("turn-host");
-        auto turnUsername = Mod::get()->getSettingValue<std::string>("turn-username");
-        auto turnPassword = Mod::get()->getSettingValue<std::string>("turn-password");
-        auto forceTurnRelay = Mod::get()->getSettingValue<bool>("force-turn-relay");
 
-        if (turnHost.empty()) turnHost = "194.226.126.115";
-        if (turnUsername.empty()) turnUsername = "mpedit";
-
-        // Normal mode is ICE automatic selection: host/srflx (direct/STUN)
-        // candidates are preferred by ICE and TURN remains available as a
-        // relay candidate only when a direct route cannot be established.
-        // Force TURN is intentionally diagnostic-only.
-        if (!turnPassword.empty()) {
+        auto network = net::NetworkConfig::load();
+        if (network.hasTurn()) {
             rtc::IceServer turn(
-                turnHost,
-                3478,
-                turnUsername,
-                turnPassword,
+                network.turnHost, 3478, network.turnUsername, network.turnPassword,
                 rtc::IceServer::RelayType::TurnUdp
             );
             config.iceServers.push_back(turn);
-
-            if (forceTurnRelay) {
+            if (network.forceTurnRelay) {
                 config.iceTransportPolicy = rtc::TransportPolicy::Relay;
                 log::warn("P2PManager: Force TURN diagnostic mode enabled");
             } else {
                 log::info("P2PManager: ICE auto mode: direct/STUN preferred, TURN fallback available");
             }
         } else {
-            log::info("P2PManager: ICE direct/STUN mode; no TURN credentials configured");
+            log::info("P2PManager: ICE direct/STUN mode; TURN is not configured");
         }
         return config;
     }
 
     std::string P2PManager::getSignalingUrl() {
-        auto url = Mod::get()->getSettingValue<std::string>("signaling-url");
-        if (url.empty()) return "https://194.226.126.115:8443";
-        return url;
+        return net::NetworkConfig::load().signalingUrl;
     }
-
 
 
     P2PManager::State P2PManager::getState() const {
@@ -120,6 +104,22 @@ namespace mpedit {
     std::string P2PManager::getError() const {
         std::lock_guard lock(m_stateMutex);
         return m_error;
+    }
+
+    bool P2PManager::supportsCapability(int playerId, net::Capability capability) {
+        std::lock_guard lock(m_peersMutex);
+        auto it = m_peers.find(playerId);
+        return it != m_peers.end() && net::hasCapability(it->second.capabilities, capability);
+    }
+
+    std::size_t P2PManager::getTotalReliableQueueDepth() {
+        std::lock_guard lock(m_peersMutex);
+        std::size_t depth = 0;
+        for (auto const& [id, peer] : m_peers) {
+            (void)id;
+            depth += peer.bulkReliableQueue.size();
+        }
+        return depth;
     }
 
     bool P2PManager::isPeerReconnect(int playerId) {
@@ -288,6 +288,7 @@ namespace mpedit {
     }
 
     void P2PManager::sendTo(int playerId, std::vector<uint8_t> const& data, ChannelType channel) {
+        sync::SyncMetrics::get().recordOutboundBytes(data.size());
         std::lock_guard lock(m_peersMutex);
         auto it = m_peers.find(playerId);
         if (it == m_peers.end()) return;
@@ -594,16 +595,18 @@ namespace mpedit {
         if (opcode == static_cast<uint8_t>(proto::Opcode::ProtocolHello)) {
             proto::Reader helloReader(data + 1, len - 1);
             auto hello = proto::deserializeProtocolHello(helloReader);
-            if (helloReader.hasError() || hello.protocolVersion != kProtocolVersion) {
+            auto remoteCapabilities = net::normalizeCapabilities(hello.protocolVersion, hello.capabilities);
+            if (helloReader.hasError() || !net::isCompatible(hello.protocolVersion, remoteCapabilities)) {
                 log::warn(
-                    "P2PManager: incompatible protocol from player {} (remote={}, local={})",
+                    "P2PManager: incompatible peer {} (protocol={}, capabilities={}, localProtocol={})",
                     fromPlayerId,
                     hello.protocolVersion,
-                    kProtocolVersion
+                    remoteCapabilities,
+                    net::kCurrentProtocol
                 );
 
                 auto errorMsg = proto::serializeError(
-                    "Incompatible Multiplayer Edit protocol. Both players must use v0.5.1 or newer compatible builds."
+                    "Incompatible Multiplayer Edit capabilities"
                 );
                 sendTo(fromPlayerId, errorMsg, ChannelType::Reliable);
 
@@ -624,6 +627,12 @@ namespace mpedit {
                 if (it != m_peers.end()) {
                     it->second.protocolVerified = true;
                     it->second.protocolVersion = hello.protocolVersion;
+                    it->second.capabilities = remoteCapabilities;
+                    if (m_role == Role::Client && fromPlayerId == 0) {
+                        m_hostMigrationAvailable.store(
+                            net::hasCapability(remoteCapabilities, net::Capability::HostMigration)
+                        );
+                    }
                     buffered = std::move(it->second.preHandshakeMessages);
                     it->second.preHandshakeMessages.clear();
                 }
@@ -900,7 +909,11 @@ namespace mpedit {
             if (m_role == Role::Client && playerId == 0) {
                 if (unexpected) {
                     m_state.store(State::Reconnecting);
-                    scheduleClientReconnect();
+                    if (m_hostMigrationAvailable.load() && !m_signalingToken.empty()) {
+                        requestHostMigration();
+                    } else {
+                        scheduleClientReconnect();
+                    }
                     return;
                 }
                 for (auto& cb : m_onError) {
@@ -951,6 +964,8 @@ namespace mpedit {
         req.header("Content-Type", "application/json");
         auto body = matjson::Value();
         body["playerName"] = playerName;
+        body["protocol"] = static_cast<int>(net::kCurrentProtocol);
+        body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -960,6 +975,9 @@ namespace mpedit {
                     auto json = res.json().unwrapOr(matjson::Value());
                     auto roomCode = json.get<std::string>("roomCode").unwrapOr("");
                     m_signalingRoomId = json.get<std::string>("roomId").unwrapOr("");
+                    m_signalingToken = json.get<std::string>("sessionToken").unwrapOr("");
+                    m_signalingGeneration = static_cast<uint32_t>(json.get<int>("generation").unwrapOr(0));
+                    m_signalingApi = static_cast<uint32_t>(json.get<int>("signalingApi").unwrapOr(1));
 
                      if (roomCode.empty()) {
                         std::vector<ErrorCb> callbacks;
@@ -1018,6 +1036,9 @@ namespace mpedit {
         auto url = getSignalingUrl() + "/rooms/" + code + "/signal?role=" + role + "&playerId=" + std::to_string(playerId);
 
         auto req = web::WebRequest();
+        if (!m_signalingToken.empty()) {
+            req.header("Authorization", "Bearer " + m_signalingToken);
+        }
         req.timeout(std::chrono::seconds(30));
 
         m_signalPollListener.spawn(
@@ -1048,6 +1069,9 @@ namespace mpedit {
         auto url = getSignalingUrl() + "/rooms/" + roomCode + "/signal";
         auto req = web::WebRequest();
         req.header("Content-Type", "application/json");
+        if (!m_signalingToken.empty()) {
+            req.header("Authorization", "Bearer " + m_signalingToken);
+        }
         req.bodyJSON(msg);
         async::spawn(req.post(url));
     }
@@ -1171,6 +1195,8 @@ namespace mpedit {
         req.header("Content-Type", "application/json");
         auto body = matjson::Value();
         body["playerName"] = playerName;
+        body["protocol"] = static_cast<int>(net::kCurrentProtocol);
+        body["capabilities"] = static_cast<double>(net::kLocalCapabilities);
         req.bodyJSON(body);
 
         m_signalingListener.spawn(
@@ -1180,6 +1206,9 @@ namespace mpedit {
                     auto json = res.json().unwrapOr(matjson::Value());
                     m_localPlayerId = json.get<int>("playerId").unwrapOr(-1);
                     auto hostName = json.get<std::string>("hostName").unwrapOr("Host");
+                    m_signalingToken = json.get<std::string>("sessionToken").unwrapOr(m_signalingToken);
+                    m_signalingGeneration = static_cast<uint32_t>(json.get<int>("generation").unwrapOr(static_cast<int>(m_signalingGeneration)));
+                    m_signalingApi = static_cast<uint32_t>(json.get<int>("signalingApi").unwrapOr(static_cast<int>(m_signalingApi)));
 
                     if (m_localPlayerId < 0) {
                         if (m_state.load() == State::Reconnecting) {
@@ -1608,12 +1637,89 @@ namespace mpedit {
 
         if (!becameTransportReady) return;
 
-        auto hello = proto::serializeProtocolHello(kProtocolVersion);
+        auto hello = proto::serializeProtocolHello(net::kCurrentProtocol, net::kLocalCapabilities);
         sendTo(pid, hello, ChannelType::Reliable);
     }
 
 
 
+
+    void P2PManager::requestHostMigration() {
+        if (m_role != Role::Client || m_roomCode.empty() || m_signalingToken.empty()) {
+            scheduleClientReconnect();
+            return;
+        }
+
+        auto url = getSignalingUrl() + "/rooms/" + m_roomCode + "/migrate";
+        auto req = web::WebRequest();
+        req.header("Content-Type", "application/json");
+        req.header("Authorization", "Bearer " + m_signalingToken);
+        auto body = matjson::Value();
+        body["generation"] = static_cast<int>(m_signalingGeneration);
+        body["playerName"] = m_localPlayerName;
+        req.bodyJSON(body);
+
+        log::warn("P2PManager: host lost; requesting migration for generation {}", m_signalingGeneration);
+        m_migrationListener.spawn(
+            req.post(url),
+            [this](web::WebResponse res) {
+                if (m_role != Role::Client || m_state.load() != State::Reconnecting) return;
+                if (!res.ok()) {
+                    log::warn("P2PManager: migration endpoint returned {}; reconnect fallback", res.code());
+                    scheduleClientReconnect();
+                    return;
+                }
+
+                auto json = res.json().unwrapOr(matjson::Value());
+                auto role = json.get<std::string>("role").unwrapOr("client");
+                auto generation = static_cast<uint32_t>(
+                    json.get<int>("generation").unwrapOr(static_cast<int>(m_signalingGeneration))
+                );
+                m_signalingGeneration = generation;
+
+                if (role == "host") {
+                    auto token = json.get<std::string>("sessionToken").unwrapOr(m_signalingToken);
+                    becomeMigratedHost(token, generation);
+                } else {
+                    scheduleClientReconnect();
+                }
+            }
+        );
+    }
+
+    void P2PManager::becomeMigratedHost(std::string const& token, uint32_t generation) {
+        stopSignalPolling();
+        {
+            std::lock_guard lock(m_peersMutex);
+            for (auto& [id, peer] : m_peers) {
+                (void)id;
+                if (peer.reliable) peer.reliable->close();
+                if (peer.unreliable) peer.unreliable->close();
+                if (peer.pc) peer.pc->close();
+            }
+            m_peers.clear();
+        }
+
+        {
+            std::lock_guard lock(m_stateMutex);
+            m_role = Role::Host;
+            m_localPlayerId = 0;
+        }
+        m_signalingToken = token;
+        m_signalingGeneration = generation;
+        m_nextPlayerId = 1;
+        m_reconnectAttempts = 0;
+        m_reconnectScheduled.store(false);
+        m_hostMigrationAvailable.store(false);
+        m_state.store(State::Connected);
+
+        auto room = getRoomCode();
+        startSignalPolling(room, "host", 0);
+        log::info("P2PManager: promoted to host for room {} generation {}", room, generation);
+        queueInMainThread([this, room]() {
+            for (auto& cb : m_onSessionStarted) cb(room, 0);
+        });
+    }
 
     void P2PManager::scheduleClientReconnect() {
         if (m_role != Role::Client) return;
@@ -1667,6 +1773,9 @@ namespace mpedit {
         if (m_role == Role::Host && !m_roomCode.empty()) {
             auto url = getSignalingUrl() + "/rooms/" + m_roomCode;
             auto req = web::WebRequest();
+            if (!m_signalingToken.empty()) {
+                req.header("Authorization", "Bearer " + m_signalingToken);
+            }
             async::spawn(req.send("DELETE", url));
         }
 
@@ -1694,6 +1803,10 @@ namespace mpedit {
         m_globalRevision.store(0);
         m_lastGlobalAuthor.store(0);
         m_signalingRoomId.clear();
+        m_signalingToken.clear();
+        m_signalingGeneration = 0;
+        m_signalingApi = 1;
+        m_hostMigrationAvailable.store(false);
 
         log::info("P2PManager: Session ended");
     }

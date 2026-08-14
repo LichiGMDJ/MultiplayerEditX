@@ -326,7 +326,7 @@ namespace mpedit::proto {
     std::vector<uint8_t> serializePlayerJoined(
         int playerId, std::string const& name, int colorIndex);
     std::vector<uint8_t> serializePlayerLeft(int playerId);
-    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion);
+    std::vector<uint8_t> serializeProtocolHello(uint32_t protocolVersion, uint64_t capabilities);
 
     std::vector<uint8_t> serializeReliableEnvelope(
         uint32_t sequence, std::vector<uint8_t> const& payload);
@@ -463,6 +463,7 @@ namespace mpedit::proto {
 
     struct ProtocolHelloMsg {
         uint32_t protocolVersion = 0;
+        uint64_t capabilities = 0;
     };
     ProtocolHelloMsg deserializeProtocolHello(Reader& r);
 

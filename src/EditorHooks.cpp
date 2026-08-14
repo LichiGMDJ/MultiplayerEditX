@@ -18,6 +18,8 @@
 #include "ui/SessionStatusNode.hpp"
 #include "ui/CursorNode.hpp"
 #include "ui/UpdateHelperNode.hpp"
+#include "sync/AdaptiveSyncPolicy.hpp"
+#include "sync/SyncMetrics.hpp"
 
 using namespace geode::prelude;
 using namespace mpedit;
@@ -369,6 +371,11 @@ namespace {
 
         uint32_t totalChunks = static_cast<uint32_t>(chunks.size());
         uint32_t totalObjects = static_cast<uint32_t>(allUuids.size());
+        sync::SyncMetrics::get().recordSerializedObjects(totalObjects);
+        sync::SyncMetrics::get().recordOutboundBytes(compressedBytes.size());
+        if (totalObjects >= sync::AdaptiveSyncPolicy::fullSnapshotWarningThreshold()) {
+            log::warn("EditorHooks: large authoritative snapshot: {} objects, {} compressed bytes", totalObjects, compressedBytes.size());
+        }
 
         // 4. Send SyncLevelStart
         auto startMsg = proto::serializeSyncLevelStart(totalChunks, totalObjects, settings);
@@ -454,6 +461,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         int m_lastHostAudioTrack = 0;
         bool m_musicBaselineReady = false;
         float m_externalCompatScanTimer = 0.f;
+        float m_syncMetricsTimer = 0.f;
         std::unordered_set<std::string> m_externalCompatLiveUuids;
         float m_integrityCheckTimer = 0.f;
         bool m_forceIntegrityCheck = false;
@@ -966,11 +974,16 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         // send a stable UUID/saveString digest and receive targeted repair only
         // when the state differs. Reconnect forces an immediate digest.
         m_fields->m_integrityCheckTimer += dt;
+        std::size_t liveObjectCount = this->m_objects ? this->m_objects->count() : 0;
+        float integrityInterval = sync::AdaptiveSyncPolicy::integrityIntervalSeconds(liveObjectCount);
+        bool periodicIntegrityDue =
+            sync::AdaptiveSyncPolicy::periodicIntegrityEnabled(liveObjectCount) &&
+            m_fields->m_integrityCheckTimer >= integrityInterval;
         if (
             session.getRole() == SessionManager::Role::Client &&
             handler.isInitialSyncCompleted() &&
             !handler.isProcessingRemote() &&
-            (m_fields->m_forceIntegrityCheck || m_fields->m_integrityCheckTimer >= 20.0f)
+            (m_fields->m_forceIntegrityCheck || periodicIntegrityDue)
         ) {
             m_fields->m_integrityCheckTimer = 0.f;
             m_fields->m_forceIntegrityCheck = false;
@@ -981,7 +994,8 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         // Object Workshop-style bulk tools, etc.) that may bypass create/remove hooks.
         m_fields->m_externalCompatScanTimer += dt;
         if (
-            m_fields->m_externalCompatScanTimer >= 0.25f &&
+            m_fields->m_externalCompatScanTimer >=
+                sync::AdaptiveSyncPolicy::externalCompatibilityScanIntervalSeconds(liveObjectCount) &&
             !isPlaytesting &&
             handler.isInitialSyncCompleted() &&
             !handler.isProcessingRemote()
@@ -1038,6 +1052,19 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
             }
 
             m_fields->m_externalCompatLiveUuids = std::move(currentUuids);
+        }
+
+        m_fields->m_syncMetricsTimer += dt;
+        if (m_fields->m_syncMetricsTimer >= 5.f) {
+            m_fields->m_syncMetricsTimer = 0.f;
+            auto& metrics = sync::SyncMetrics::get();
+            metrics.setReliableQueueDepth(P2PManager::get().getTotalReliableQueueDepth());
+            auto sample = metrics.sample();
+            log::info(
+                "SYNC PERF objects/s={} bytes/s={} reliableQueue={} objectsTotal={} bytesTotal={}",
+                sample.objectsPerSecond, sample.bytesPerSecond, sample.reliableQueueDepth,
+                sample.totalObjectsSerialized, sample.totalBytesQueued
+            );
         }
 
         // Send cursor position periodically

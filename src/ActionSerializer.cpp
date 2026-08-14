@@ -1,4 +1,5 @@
 #include "ActionSerializer.hpp"
+#include "sync/SyncMetrics.hpp"
 #include <Geode/Geode.hpp>
 #include <sstream>
 #include <unordered_map>
@@ -16,6 +17,7 @@ namespace mpedit::ActionSerializer {
         data.uuid = uuid;
 
         if (!obj) return data;
+        sync::SyncMetrics::get().recordSerializedObjects(1);
 
         data.objectID = obj->m_objectID;
         data.x = obj->getPositionX();

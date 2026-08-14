@@ -1116,7 +1116,11 @@ namespace mpedit {
                                 rtc::Description(sdp, rtc::Description::Type::Answer, rtc::Description::Role::Active));
                             
                             for (auto const& pCand : it->second.pendingCandidates) {
-                                it->second.pc->addRemoteCandidate(rtc::Candidate(pCand.candidate, pCand.mid));
+                                try {
+                                    it->second.pc->addRemoteCandidate(rtc::Candidate(pCand.candidate, pCand.mid));
+                                } catch (std::exception const& e) {
+                                    log::warn("P2PManager: buffered ICE candidate rejected: {}", e.what());
+                                }
                             }
                             it->second.pendingCandidates.clear();
                         } else {
@@ -1137,7 +1141,11 @@ namespace mpedit {
                                 rtc::Description(sdp, rtc::Description::Type::Offer, rtc::Description::Role::ActPass));
                             
                             for (auto const& pCand : it->second.pendingCandidates) {
-                                it->second.pc->addRemoteCandidate(rtc::Candidate(pCand.candidate, pCand.mid));
+                                try {
+                                    it->second.pc->addRemoteCandidate(rtc::Candidate(pCand.candidate, pCand.mid));
+                                } catch (std::exception const& e) {
+                                    log::warn("P2PManager: buffered ICE candidate rejected: {}", e.what());
+                                }
                             }
                             it->second.pendingCandidates.clear();
 
@@ -1153,13 +1161,26 @@ namespace mpedit {
                 int clientId = msg.get<int>("playerId").unwrapOr(-1);
                 int fromId = (m_role == Role::Host) ? clientId : 0;
                 
-                if (!cand.empty() && !mid.empty() && fromId >= 0) {
+                if (!cand.empty() && fromId >= 0) {
                     std::lock_guard lock(m_peersMutex);
                     auto it = m_peers.find(fromId);
                     if (it != m_peers.end() && it->second.pc) {
+                        log::debug(
+                            "P2PManager: remote ICE candidate from {} received (mid='{}', bytes={})",
+                            fromId,
+                            mid,
+                            cand.size()
+                        );
                         if (it->second.pc->remoteDescription().has_value()) {
-                            rtc::Candidate rtcCand(cand, mid);
-                            it->second.pc->addRemoteCandidate(rtcCand);
+                            try {
+                                it->second.pc->addRemoteCandidate(rtc::Candidate(cand, mid));
+                            } catch (std::exception const& e) {
+                                log::warn(
+                                    "P2PManager: failed to apply remote ICE candidate from {}: {}",
+                                    fromId,
+                                    e.what()
+                                );
+                            }
                         } else {
                             log::info("P2PManager: Remote description not set, buffering candidate from {}", fromId);
                             it->second.pendingCandidates.push_back({cand, mid});
@@ -1274,10 +1295,17 @@ namespace mpedit {
                     auto answerSent = std::make_shared<bool>(false);
 
                     pc->onLocalCandidate([this, myId, roomCode](rtc::Candidate candidate) {
+                        auto candidateText = std::string(candidate.candidate());
+                        auto candidateMid = std::string(candidate.mid());
+                        log::debug(
+                            "P2PManager: local ICE candidate client->host (mid='{}', bytes={})",
+                            candidateMid,
+                            candidateText.size()
+                        );
                         auto body = matjson::Value();
                         body["type"] = "candidate";
-                        body["candidate"] = std::string(candidate.candidate());
-                        body["mid"] = std::string(candidate.mid());
+                        body["candidate"] = candidateText;
+                        body["mid"] = candidateMid;
                         body["playerId"] = myId;
                         queueInMainThread([this, roomCode, body]() {
                             sendSignalingMessage(roomCode, body);
@@ -1335,6 +1363,7 @@ namespace mpedit {
                     });
 
                     pc->onStateChange([this](rtc::PeerConnection::State state) {
+                        log::info("P2PManager: client PeerConnection state={}", static_cast<int>(state));
                         if (state == rtc::PeerConnection::State::Disconnected ||
                             state == rtc::PeerConnection::State::Failed ||
                             state == rtc::PeerConnection::State::Closed) {
@@ -1445,10 +1474,18 @@ namespace mpedit {
         auto offerSent = std::make_shared<bool>(false);
 
         pc->onLocalCandidate([this, clientPlayerId, roomCode](rtc::Candidate candidate) {
+            auto candidateText = std::string(candidate.candidate());
+            auto candidateMid = std::string(candidate.mid());
+            log::debug(
+                "P2PManager: local ICE candidate host->{} (mid='{}', bytes={})",
+                clientPlayerId,
+                candidateMid,
+                candidateText.size()
+            );
             auto body = matjson::Value();
             body["type"] = "candidate";
-            body["candidate"] = std::string(candidate.candidate());
-            body["mid"] = std::string(candidate.mid());
+            body["candidate"] = candidateText;
+            body["mid"] = candidateMid;
             body["targetPlayerId"] = clientPlayerId;
             queueInMainThread([this, roomCode, body]() {
                 sendSignalingMessage(roomCode, body);
@@ -1493,6 +1530,11 @@ namespace mpedit {
         });
 
         pc->onStateChange([this, clientPlayerId](rtc::PeerConnection::State state) {
+            log::info(
+                "P2PManager: host PeerConnection state={} player={}",
+                static_cast<int>(state),
+                clientPlayerId
+            );
             if (state == rtc::PeerConnection::State::Disconnected ||
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
@@ -1502,7 +1544,18 @@ namespace mpedit {
             }
         });
 
-        pc->setLocalDescription();
+        // createDataChannel() may already have triggered offer generation. Calling
+        // setLocalDescription() again in HaveLocalOffer produces a libdatachannel
+        // warning and can race trickle ICE callbacks. Only start negotiation when
+        // the peer is still stable.
+        if (pc->signalingState() == rtc::PeerConnection::SignalingState::Stable) {
+            pc->setLocalDescription();
+        } else {
+            log::debug(
+                "P2PManager: offer already generated for player {}; skipping duplicate setLocalDescription",
+                clientPlayerId
+            );
+        }
 
         {
             std::lock_guard lock(m_peersMutex);

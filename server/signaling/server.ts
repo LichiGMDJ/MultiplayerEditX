@@ -159,8 +159,14 @@ function validateSignal(message: Record<string, unknown>): string | null {
   if (type === "candidate") {
     const candidate = typeof message.candidate === "string" ? message.candidate : "";
     const mid = typeof message.mid === "string" ? message.mid : "";
-    if (!candidate || !mid || new TextEncoder().encode(candidate).byteLength > MAX_CANDIDATE_BYTES) {
+    if (!candidate || new TextEncoder().encode(candidate).byteLength > MAX_CANDIDATE_BYTES) {
       return "invalid ICE candidate";
+    }
+    // sdpMid can legitimately be empty for some libdatachannel/WebRTC paths.
+    // Validate its size when present, but never reject an otherwise valid ICE
+    // candidate solely because MID is empty.
+    if (new TextEncoder().encode(mid).byteLength > 256) {
+      return "invalid ICE candidate mid";
     }
   }
   return null;
@@ -402,6 +408,7 @@ async function handle(req: Request): Promise<Response> {
         enqueue(target, { ...message, generation: room.generation });
       } else {
         const normalized = { ...message, playerId: sender.playerId, generation: room.generation };
+        delete normalized.targetPlayerId;
         enqueue(room.host, normalized);
       }
 

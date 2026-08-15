@@ -31,6 +31,11 @@ namespace mpedit {
 
     public:
         static CursorNode* create();
+
+        // Remove every remote visual immediately. This is intentionally public
+        // so SessionManager can clean the editor even while the pause layer has
+        // suspended CursorNode::update().
+        void clearRemoteVisuals();
         
         static cocos2d::ccColor3B getColorForIndex(int index);
     };

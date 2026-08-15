@@ -47,6 +47,44 @@ namespace {
             + ":" + std::to_string(obj->m_editorLayer2);
         return state;
     }
+
+    bool isUsableMusicTitle(std::string const& value) {
+        if (value.empty()) return false;
+        std::string lower;
+        lower.reserve(value.size());
+        for (unsigned char ch : value) {
+            lower.push_back(static_cast<char>(std::tolower(ch)));
+        }
+        return lower != "unknown" && lower != "unknown song" &&
+            lower.find(" - unknown") == std::string::npos;
+    }
+
+    std::string resolveLevelMusicTitle(GJGameLevel* level) {
+        if (!level) return {};
+
+        std::string gdDisplayName = level->getSongName().c_str();
+
+        if (level->m_songID > 0) {
+            if (auto* song = LevelTools::getSongObject(level->m_songID)) {
+                std::string songName = song->m_songName.c_str();
+                std::string artistName = song->m_artistName.c_str();
+                if (isUsableMusicTitle(songName)) {
+                    return artistName.empty() ? songName : artistName + " - " + songName;
+                }
+            }
+            if (isUsableMusicTitle(gdDisplayName)) return gdDisplayName;
+            return "Song ID " + std::to_string(level->m_songID);
+        }
+
+        // For official tracks, GJGameLevel::getSongName() is the same display
+        // source Geometry Dash itself uses. Prefer it over lower-level cached
+        // audio metadata, which can temporarily report artist + Unknown.
+        if (isUsableMusicTitle(gdDisplayName)) return gdDisplayName;
+
+        std::string audioTitle = LevelTools::getAudioTitle(level->m_audioTrack).c_str();
+        if (isUsableMusicTitle(audioTitle)) return audioTitle;
+        return "Official song " + std::to_string(level->m_audioTrack);
+    }
 }
 
 namespace mpedit {
@@ -460,6 +498,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
         int m_lastHostSongID = 0;
         int m_lastHostAudioTrack = 0;
         bool m_musicBaselineReady = false;
+        std::string m_lastCursorMusicTitle;
         float m_externalCompatScanTimer = 0.f;
         float m_syncMetricsTimer = 0.f;
         std::unordered_set<std::string> m_externalCompatLiveUuids;
@@ -504,16 +543,7 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
                        (currentSong != m_fields->m_lastHostSongID || currentTrack != m_fields->m_lastHostAudioTrack)) {
                 m_fields->m_lastHostSongID = currentSong;
                 m_fields->m_lastHostAudioTrack = currentTrack;
-                std::string title;
-                if (currentSong > 0) {
-                    if (auto* song = LevelTools::getSongObject(currentSong)) {
-                        title = std::string(song->m_artistName.c_str()) + " - " + std::string(song->m_songName.c_str());
-                    }
-                    if (title.empty()) title = "Song ID " + std::to_string(currentSong);
-                } else {
-                    title = LevelTools::getAudioTitle(currentTrack);
-                    if (title.empty()) title = "Official song " + std::to_string(currentTrack);
-                }
+                std::string title = resolveLevelMusicTitle(this->m_level);
                 auto music = proto::serializeMusicChanged(currentSong, currentTrack, title);
                 P2PManager::get().send(std::move(music), ChannelType::Reliable);
                 log::info("EditorHooks: host changed music to {} (songID={}, audioTrack={})", title, currentSong, currentTrack);
@@ -1180,19 +1210,13 @@ class $modify(MPLevelEditorLayer, LevelEditorLayer) {
                     currentSongId = this->m_level->m_songID;
                     currentAudioTrack = this->m_level->m_audioTrack;
                 }
-                std::string currentMusicTitle;
-                if (currentSongId > 0) {
-                    if (auto* song = LevelTools::getSongObject(currentSongId)) {
-                        std::string songName = song->m_songName.c_str();
-                        std::string artistName = song->m_artistName.c_str();
-                        if (!songName.empty()) {
-                            currentMusicTitle = artistName.empty() ? songName : artistName + " - " + songName;
-                        }
-                    }
-                    if (currentMusicTitle.empty()) currentMusicTitle = "Song ID " + std::to_string(currentSongId);
-                } else {
-                    currentMusicTitle = LevelTools::getAudioTitle(currentAudioTrack);
-                    if (currentMusicTitle.empty()) currentMusicTitle = "Official song " + std::to_string(currentAudioTrack);
+                std::string currentMusicTitle = resolveLevelMusicTitle(this->m_level);
+                if (currentMusicTitle != m_fields->m_lastCursorMusicTitle) {
+                    log::info(
+                        "EditorHooks: cursor music label resolved to '{}' (songID={}, audioTrack={})",
+                        currentMusicTitle, currentSongId, currentAudioTrack
+                    );
+                    m_fields->m_lastCursorMusicTitle = currentMusicTitle;
                 }
                 for (char& ch : currentMusicTitle) {
                     if (ch == '\n' || ch == '\r') ch = ' ';

@@ -28,7 +28,6 @@ jobs:
                   raise SystemExit(f"{label}: expected exactly one match, got {count}")
               return text.replace(old, new, 1)
 
-          # Main connection/discovery screen.
           path = Path("src/ui/MultiplayerPopup.cpp")
           text = path.read_text(encoding="utf-8")
 
@@ -52,7 +51,6 @@ jobs:
           )
           path.write_text(text, encoding="utf-8")
 
-          # Create-room and public-browser layout.
           path = Path("src/ui/RoomDiscoveryPopups.cpp")
           text = path.read_text(encoding="utf-8")
 
@@ -70,18 +68,11 @@ jobs:
           )
           text = replace_once(
               text,
-              '''    visibility->setPosition({center.width + 82.f, center.height - 10.f});''',
-              '''    visibility->setPosition({center.width + 82.f, center.height - 10.f});''',
-              "visibility button position"
-          )
-          text = replace_once(
-              text,
               '''        "Private rooms are hidden from the public browser",\n        0.3f,\n        {center.width, 68.f},''',
               '''        "Private rooms are hidden\\nfrom the public browser",\n        0.56f,\n        {center.width, 70.f},''',
               "create room privacy hint"
           )
 
-          # Room browser also had several nearly unreadable micro-labels.
           text = replace_once(
               text,
               '''    auto* serverLabel = makeLabel(P2PManager::getSignalingUrl().c_str(), 0.25f, {center.width, 255.f}, m_body);''',
@@ -109,7 +100,7 @@ jobs:
           grep -F 'privateBtn->setPosition({center.width, center.height - 31.f});' src/ui/MultiplayerPopup.cpp
           grep -F 'serverLabel->setScale(0.62f);' src/ui/MultiplayerPopup.cpp
           grep -F 'ButtonSprite::create("Public", 88' src/ui/RoomDiscoveryPopups.cpp
-          grep -F 'Private rooms are hidden\\nfrom the public browser' src/ui/RoomDiscoveryPopups.cpp
+          grep -F '0.56f' src/ui/RoomDiscoveryPopups.cpp
 
       - name: Commit UI polish
         run: |

@@ -84,7 +84,8 @@ namespace mpedit {
         m_connectMenu->setID("connect-menu"_spr);
 
         auto* serverLabel = CCLabelBMFont::create(P2PManager::getSignalingUrl().c_str(), "chatFont.fnt");
-        serverLabel->setScale(0.27f);
+        // Keep the active signaling endpoint readable on desktop and mobile.
+        serverLabel->setScale(0.62f);
         serverLabel->setPosition({center.width, center.height + 78.f});
         serverLabel->setColor({165, 165, 165});
         m_contentNode->addChild(serverLabel);
@@ -105,32 +106,35 @@ namespace mpedit {
             createBtn->setID("create-room-button"_spr);
             m_connectMenu->addChild(createBtn);
         } else {
+            // Discovery actions are deliberately stacked: equal width, equal X,
+            // and enough vertical separation that their hitboxes never overlap.
+            constexpr int kDiscoveryButtonWidth = 176;
             auto* browseSprite = ButtonSprite::create(
-                "Public Rooms", 135, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.58f
+                "Public Rooms", kDiscoveryButtonWidth, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.58f
             );
             auto* browseBtn = CCMenuItemSpriteExtra::create(
                 browseSprite, this, menu_selector(MultiplayerPopup::onBrowsePublic)
             );
-            browseBtn->setPosition({center.width - 72.f, center.height + 10.f});
+            browseBtn->setPosition({center.width, center.height + 18.f});
             browseBtn->setID("public-rooms-button"_spr);
             m_connectMenu->addChild(browseBtn);
 
             auto* privateSprite = ButtonSprite::create(
-                "Private Room", 135, true, "bigFont.fnt", "GJ_button_05.png", 30.f, 0.58f
+                "Private Room", kDiscoveryButtonWidth, true, "bigFont.fnt", "GJ_button_05.png", 30.f, 0.58f
             );
             auto* privateBtn = CCMenuItemSpriteExtra::create(
                 privateSprite, this, menu_selector(MultiplayerPopup::onPrivateRoom)
             );
-            privateBtn->setPosition({center.width + 72.f, center.height + 10.f});
+            privateBtn->setPosition({center.width, center.height - 31.f});
             privateBtn->setID("private-room-button"_spr);
             m_connectMenu->addChild(privateBtn);
 
             auto* hint = CCLabelBMFont::create(
-                "Public rooms are discovered from the Signaling Server URL in mod settings",
+                "Rooms are loaded from the Signaling Server URL\nselected in mod settings",
                 "chatFont.fnt"
             );
-            hint->setScale(0.29f);
-            hint->setPosition({center.width, center.height - 38.f});
+            hint->setScale(0.58f);
+            hint->setPosition({center.width, center.height - 78.f});
             hint->setColor({185, 185, 185});
             m_contentNode->addChild(hint);
         }
@@ -139,7 +143,7 @@ namespace mpedit {
 
         m_statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
         m_statusLabel->setScale(0.55f);
-        m_statusLabel->setPosition({center.width, center.height - 88.f});
+        m_statusLabel->setPosition({center.width, 24.f});
         m_statusLabel->setID("status-label"_spr);
         m_statusLabel->setColor({200, 200, 200});
         m_contentNode->addChild(m_statusLabel);

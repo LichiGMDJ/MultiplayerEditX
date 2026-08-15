@@ -1259,6 +1259,12 @@ namespace mpedit {
                         createHostPeer(clientId, clientName);
                     }
                 }
+            } else if (type == "client_left") {
+                int clientId = msg.get<int>("playerId").unwrapOr(-1);
+                if (m_role == Role::Host && clientId > 0) {
+                    log::info("P2PManager: signaling reports graceful leave for player {}", clientId);
+                    onPeerDisconnected(clientId, false);
+                }
             } else if (type == "answer") {
                 auto sdp = msg.get<std::string>("sdp").unwrapOr("");
                 int clientId = msg.get<int>("playerId").unwrapOr(-1);
@@ -2015,7 +2021,17 @@ namespace mpedit {
                 if (!m_httpRelayPollingActive.load()) return;
                 if (res.ok()) {
                     handleHttpRelayMessages(res.json().unwrapOr(matjson::Value()));
-                } else if (res.code() == 401 || res.code() == 403 || res.code() == 404) {
+                } else if (res.code() == 404) {
+                    log::info("P2PManager: HTTP relay room no longer exists");
+                    m_httpRelayPollingActive.store(false);
+                    if (m_role == Role::Client) {
+                        m_state.store(State::Error);
+                        queueInMainThread([this]() {
+                            for (auto& cb : m_onError) cb("Room closed by host");
+                        });
+                    }
+                    return;
+                } else if (res.code() == 401 || res.code() == 403) {
                     log::warn("P2PManager: HTTP relay poll stopped with {}", res.code());
                     m_httpRelayPollingActive.store(false);
                     return;
@@ -2191,6 +2207,15 @@ namespace mpedit {
             [this](web::WebResponse res) {
                 if (m_role != Role::Client || m_state.load() != State::Reconnecting) return;
                 if (!res.ok()) {
+                    if (res.code() == 404 || res.code() == 410) {
+                        log::info("P2PManager: migration stopped because room no longer exists");
+                        m_reconnectScheduled.store(false);
+                        m_state.store(State::Error);
+                        queueInMainThread([this]() {
+                            for (auto& cb : m_onError) cb("Room closed by host");
+                        });
+                        return;
+                    }
                     log::warn("P2PManager: migration endpoint returned {}; reconnect fallback", res.code());
                     scheduleClientReconnect();
                     return;
@@ -2287,6 +2312,35 @@ namespace mpedit {
         stopSignalPolling();
         stopHttpRelayPolling();
 
+        // Tell signaling first, while the peer connections are still alive.
+        // This prevents a graceful host leave racing a client's /migrate call.
+        // DELETE is also used by clients to unregister their directory record.
+        if (m_role != Role::None && !m_roomCode.empty() && !m_signalingToken.empty()) {
+            auto leavingRole = m_role;
+            auto leavingRoom = m_roomCode;
+            auto url = getSignalingUrl() + "/rooms/" + leavingRoom;
+            auto req = web::WebRequest();
+            req.header("Authorization", "Bearer " + m_signalingToken);
+            req.timeout(std::chrono::seconds(2));
+            async::spawn(
+                req.send("DELETE", url),
+                [leavingRole, leavingRoom](web::WebResponse res) {
+                    if (res.ok()) {
+                        log::info(
+                            "P2PManager: signaling leave accepted room={} role={}",
+                            leavingRoom,
+                            leavingRole == Role::Host ? "host" : "client"
+                        );
+                    } else if (res.code() != 404) {
+                        log::warn(
+                            "P2PManager: signaling leave failed room={} code={} error={}",
+                            leavingRoom, res.code(), res.errorMessage()
+                        );
+                    }
+                }
+            );
+        }
+
         {
             std::lock_guard lock(m_peersMutex);
             for (auto& [id, peer] : m_peers) {
@@ -2295,15 +2349,6 @@ namespace mpedit {
                 if (peer.pc) peer.pc->close();
             }
             m_peers.clear();
-        }
-
-        if (m_role == Role::Host && !m_roomCode.empty()) {
-            auto url = getSignalingUrl() + "/rooms/" + m_roomCode;
-            auto req = web::WebRequest();
-            if (!m_signalingToken.empty()) {
-                req.header("Authorization", "Bearer " + m_signalingToken);
-            }
-            async::spawn(req.send("DELETE", url));
         }
 
         {

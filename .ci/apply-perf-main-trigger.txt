@@ -1,1 +1,0 @@
-Trigger temporary main workflow that applies .ci/perf_sync_patch.py to ui-layout-polish.

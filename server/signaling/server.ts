@@ -41,6 +41,10 @@ type RateBucket = {
 
 const PORT = 8000;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
+// Public directory liveness is intentionally much shorter than room retention.
+// A stale room can remain internally for host migration/reconnect, but must not
+// be shown as joinable after the host is gone.
+const HOST_DIRECTORY_STALE_MS = 45_000;
 const LONG_POLL_MS = 25_000;
 const RELAY_LONG_POLL_MS = 20_000;
 const MAX_QUEUE_MESSAGES = 128;
@@ -190,12 +194,16 @@ async function longPollRelay(participant: Participant): Promise<Response> {
 }
 
 function removeExpiredRooms(): void {
-  const cutoff = now() - ROOM_TTL_MS;
+  const current = now();
+  const cutoff = current - ROOM_TTL_MS;
   for (const [code, room] of rooms) {
-    if (room.lastActivityAt < cutoff) rooms.delete(code);
+    const hostStale = current - room.host.lastSeenAt > HOST_DIRECTORY_STALE_MS;
+    if (room.lastActivityAt < cutoff || (hostStale && room.clients.size === 0)) {
+      rooms.delete(code);
+    }
   }
 
-  const rateCutoff = now() - 5 * 60_000;
+  const rateCutoff = current - 5 * 60_000;
   for (const [key, bucket] of rateBuckets) {
     if (bucket.windowStart < rateCutoff) rateBuckets.delete(key);
   }
@@ -280,8 +288,12 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (req.method === "GET" && path === "/rooms") {
+    const directoryNow = now();
     const publicRooms = [...rooms.values()]
-      .filter((room) => !room.isPrivate)
+      .filter((room) =>
+        !room.isPrivate &&
+        directoryNow - room.host.lastSeenAt <= HOST_DIRECTORY_STALE_MS
+      )
       .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
       .slice(0, 100)
       .map((room) => ({
@@ -563,7 +575,17 @@ async function handle(req: Request): Promise<Response> {
 
     if (req.method === "DELETE" && parts.length === 2) {
       const token = bearerToken(req);
-      if (!token || token !== room.host.token) return json({ error: "host token required" }, 403);
+      const participant = findParticipant(room, token);
+      if (!participant) return json({ error: "unauthorized" }, 401);
+
+      // Guests must be removed from the signaling roster as soon as they press
+      // Leave. Otherwise a later host leave may migrate the room to a client
+      // that is no longer connected, leaving a ghost public room behind.
+      if (participant.token !== room.host.token) {
+        room.clients.delete(participant.playerId);
+        touch(room);
+        return json({ ok: true, left: true });
+      }
 
       const winner = electMigrationHost(room);
       if (!winner) {

@@ -81,9 +81,12 @@ protected:
     std::vector<BrowserRoomInfo> m_rooms;
     std::size_t m_page = 0;
     geode::async::TaskHolder<geode::utils::web::WebResponse> m_request;
+    bool m_fetchInFlight = false;
+    float m_autoRefreshTimer = 0.f;
 
     bool setup();
-    void fetchRooms();
+    void update(float dt) override;
+    void fetchRooms(bool showLoading = true);
     void rebuild();
     void onRefresh(cocos2d::CCObject*);
     void onJoin(cocos2d::CCObject*);

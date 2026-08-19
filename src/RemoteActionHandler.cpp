@@ -1544,11 +1544,31 @@ namespace mpedit {
             auto newObjs = createObjectsFromSaveStringRobust(editor, objectsString);
             log::info("RemoteActionHandler: Spawned {} objects from objectsString (len={})",
                 newObjs.size(), objectsString.size());
-            // Match each authoritative serialized record to the recreated object
-            // with the same object ID AND nearest serialized position. Matching by
-            // object ID alone is ambiguous on real levels where hundreds of objects
-            // share the same ID and can bind UUIDs to the wrong instance.
+            // Index recreated objects by authoritative ID + quantized position.
+            // The exact path is O(N); nearest-by-ID remains only as a defensive
+            // fallback for the rare object whose receiver-side position is normalized.
+            auto positionKey = [](int objectID, float x, float y) {
+                auto qx = static_cast<long long>(std::llround(static_cast<double>(x) * 1000.0));
+                auto qy = static_cast<long long>(std::llround(static_cast<double>(y) * 1000.0));
+                return std::to_string(objectID) + ":" + std::to_string(qx) + ":" + std::to_string(qy);
+            };
+
+            std::unordered_map<std::string, std::vector<GameObject*>> candidatesByPosition;
+            std::unordered_map<int, std::vector<GameObject*>> candidatesById;
+            candidatesByPosition.reserve(newObjs.size());
+            candidatesById.reserve(newObjs.size());
+            for (auto* candidate : newObjs) {
+                if (!candidate) continue;
+                candidatesByPosition[positionKey(
+                    candidate->m_objectID,
+                    candidate->getPositionX(),
+                    candidate->getPositionY()
+                )].push_back(candidate);
+                candidatesById[candidate->m_objectID].push_back(candidate);
+            }
+
             std::unordered_set<GameObject*> assigned;
+            assigned.reserve(newObjs.size());
             size_t mapped = 0;
             for (size_t i = 0; i < serializedObjects.size(); ++i) {
                 int expectedId = serializedObjectId(serializedObjects[i]);
@@ -1563,18 +1583,35 @@ namespace mpedit {
                 }
 
                 GameObject* match = nullptr;
-                float bestDistanceSq = 1.0e30f;
-                for (auto* candidate : newObjs) {
-                    if (!candidate || assigned.contains(candidate) || candidate->m_objectID != expectedId) continue;
-                    float dx = candidate->getPositionX() - expectedX;
-                    float dy = candidate->getPositionY() - expectedY;
-                    float distanceSq = dx * dx + dy * dy;
-                    if (distanceSq < bestDistanceSq) {
-                        bestDistanceSq = distanceSq;
-                        match = candidate;
-                        if (distanceSq <= 0.0001f) break;
+                auto exactIt = candidatesByPosition.find(positionKey(expectedId, expectedX, expectedY));
+                if (exactIt != candidatesByPosition.end()) {
+                    auto& exact = exactIt->second;
+                    while (!exact.empty() && assigned.contains(exact.back())) {
+                        exact.pop_back();
+                    }
+                    if (!exact.empty()) {
+                        match = exact.back();
+                        exact.pop_back();
                     }
                 }
+
+                if (!match) {
+                    auto idIt = candidatesById.find(expectedId);
+                    if (idIt != candidatesById.end()) {
+                        float bestDistanceSq = 1.0e30f;
+                        for (auto* candidate : idIt->second) {
+                            if (!candidate || assigned.contains(candidate)) continue;
+                            float dx = candidate->getPositionX() - expectedX;
+                            float dy = candidate->getPositionY() - expectedY;
+                            float distanceSq = dx * dx + dy * dy;
+                            if (distanceSq < bestDistanceSq) {
+                                bestDistanceSq = distanceSq;
+                                match = candidate;
+                            }
+                        }
+                    }
+                }
+
                 if (!match) {
                     log::error(
                         "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={}, x={}, y={})",
@@ -1583,8 +1620,6 @@ namespace mpedit {
                     continue;
                 }
 
-                // Reassert the serialized position after matching. This also
-                // neutralizes small receiver-side normalization differences.
                 match->setPosition({expectedX, expectedY});
                 assigned.insert(match);
                 auto tagged = decodeLayerTaggedUuid(uuids[i]);

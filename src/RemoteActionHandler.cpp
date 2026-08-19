@@ -54,16 +54,6 @@ namespace mpedit {
         std::unordered_map<int, RawBulkPasteRx> s_rawBulkPasteRx;
         uint32_t s_lastGlobalRecoveryRevision = 0;
 
-        std::set<GameObject*> snapshotExistingObjects(LevelEditorLayer* editor) {
-            std::set<GameObject*> existing;
-            if (editor && editor->m_objects) {
-                for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
-                    if (obj) existing.insert(obj);
-                }
-            }
-            return existing;
-        }
-
         std::vector<GameObject*> createObjectsFromSaveStringRobust(LevelEditorLayer* editor, std::string const& saveStr) {
             std::vector<GameObject*> newObjects;
             if (!editor || saveStr.empty()) return newObjects;
@@ -1610,7 +1600,8 @@ namespace mpedit {
                 }
             }
 
-            size_t fallbackIndex = uuids.size();            for (auto* obj : newObjs) {
+            size_t fallbackIndex = uuids.size();
+            for (auto* obj : newObjs) {
                 if (!obj || assigned.contains(obj)) continue;
                 if (getUUIDForObject(obj).empty()) {
                     registerObject("sync_extra_" + std::to_string(fallbackIndex++), obj);

@@ -54,30 +54,25 @@ namespace mpedit {
         std::unordered_map<int, RawBulkPasteRx> s_rawBulkPasteRx;
         uint32_t s_lastGlobalRecoveryRevision = 0;
 
-        std::set<GameObject*> snapshotExistingObjects(LevelEditorLayer* editor) {
-            std::set<GameObject*> existing;
-            if (editor && editor->m_objects) {
-                for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
-                    if (obj) existing.insert(obj);
-                }
-            }
-            return existing;
-        }
-
         std::vector<GameObject*> createObjectsFromSaveStringRobust(LevelEditorLayer* editor, std::string const& saveStr) {
             std::vector<GameObject*> newObjects;
             if (!editor || saveStr.empty()) return newObjects;
 
-            auto existing = snapshotExistingObjects(editor);
-
+            // Geometry Dash appends createObjectsFromString results to m_objects.
+            // Capture only the appended range instead of scanning the full level
+            // before and after every remote placement.
+            size_t beforeCount = editor->m_objects ? editor->m_objects->count() : 0;
             editor->createObjectsFromString(saveStr, true, true);
+            if (!editor->m_objects) return newObjects;
 
-            if (editor->m_objects) {
-                for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
-                    if (obj && !existing.count(obj)) {
-                        newObjects.push_back(obj);
-                    }
-                }
+            size_t afterCount = editor->m_objects->count();
+            if (afterCount <= beforeCount) return newObjects;
+            newObjects.reserve(afterCount - beforeCount);
+
+            size_t index = 0;
+            for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+                if (obj && index >= beforeCount) newObjects.push_back(obj);
+                ++index;
             }
             return newObjects;
         }
@@ -939,6 +934,10 @@ namespace mpedit {
                         }
                     }
                     if (!obj) obj = newObjs.front();
+
+                    // Sender coordinates are authoritative even if GD/mod hooks
+                    // normalize the save string on the receiving machine.
+                    obj->setPosition({objData.x, objData.y});
                     
                     if (obj->m_objectID == 31) {
                         if (auto* startPos = typeinfo_cast<StartPosObject*>(obj)) {
@@ -1541,31 +1540,81 @@ namespace mpedit {
             auto newObjs = createObjectsFromSaveStringRobust(editor, objectsString);
             log::info("RemoteActionHandler: Spawned {} objects from objectsString (len={})",
                 newObjs.size(), objectsString.size());
-            // Match each authoritative serialized record to a newly-created object
-            // with the same object ID. GD may auto-create companion objects (for
-            // example teleport portal parts), so blindly zipping newObjs with UUIDs
-            // can shift every later UUID and make future deletes hit the wrong object.
+            // Index recreated objects by authoritative ID + quantized position.
+            // Exact lookup is O(N); nearest-by-ID is only a defensive fallback for
+            // the rare receiver-side normalization case.
+            auto positionKey = [](int objectID, float x, float y) {
+                auto qx = static_cast<long long>(std::llround(static_cast<double>(x) * 1000.0));
+                auto qy = static_cast<long long>(std::llround(static_cast<double>(y) * 1000.0));
+                return std::to_string(objectID) + ":" + std::to_string(qx) + ":" + std::to_string(qy);
+            };
+
+            std::unordered_map<std::string, std::vector<GameObject*>> candidatesByPosition;
+            std::unordered_map<int, std::vector<GameObject*>> candidatesById;
+            candidatesByPosition.reserve(newObjs.size());
+            candidatesById.reserve(newObjs.size());
+            for (auto* candidate : newObjs) {
+                if (!candidate) continue;
+                candidatesByPosition[positionKey(
+                    candidate->m_objectID,
+                    candidate->getPositionX(),
+                    candidate->getPositionY()
+                )].push_back(candidate);
+                candidatesById[candidate->m_objectID].push_back(candidate);
+            }
+
             std::unordered_set<GameObject*> assigned;
+            assigned.reserve(newObjs.size());
             size_t mapped = 0;
             for (size_t i = 0; i < serializedObjects.size(); ++i) {
                 int expectedId = serializedObjectId(serializedObjects[i]);
+                auto fields = ActionSerializer::parseSaveString(serializedObjects[i]);
+                float expectedX = 0.f;
+                float expectedY = 0.f;
+                if (auto it = fields.find("2"); it != fields.end()) {
+                    expectedX = geode::utils::numFromString<float>(it->second).unwrapOr(0.f);
+                }
+                if (auto it = fields.find("3"); it != fields.end()) {
+                    expectedY = geode::utils::numFromString<float>(it->second).unwrapOr(0.f);
+                }
+
                 GameObject* match = nullptr;
-                for (auto* candidate : newObjs) {
-                    if (!candidate || assigned.contains(candidate)) continue;
-                    if (candidate->m_objectID == expectedId) {
-                        match = candidate;
-                        break;
+                auto exactIt = candidatesByPosition.find(positionKey(expectedId, expectedX, expectedY));
+                if (exactIt != candidatesByPosition.end()) {
+                    auto& exact = exactIt->second;
+                    while (!exact.empty() && assigned.contains(exact.back())) exact.pop_back();
+                    if (!exact.empty()) {
+                        match = exact.back();
+                        exact.pop_back();
                     }
                 }
+
+                if (!match) {
+                    auto idIt = candidatesById.find(expectedId);
+                    if (idIt != candidatesById.end()) {
+                        float bestDistanceSq = 1.0e30f;
+                        for (auto* candidate : idIt->second) {
+                            if (!candidate || assigned.contains(candidate)) continue;
+                            float dx = candidate->getPositionX() - expectedX;
+                            float dy = candidate->getPositionY() - expectedY;
+                            float distanceSq = dx * dx + dy * dy;
+                            if (distanceSq < bestDistanceSq) {
+                                bestDistanceSq = distanceSq;
+                                match = candidate;
+                            }
+                        }
+                    }
+                }
+
                 if (!match) {
                     log::error(
-                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={})",
-                        i,
-                        expectedId
+                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={}, x={}, y={})",
+                        i, expectedId, expectedX, expectedY
                     );
                     continue;
                 }
 
+                match->setPosition({expectedX, expectedY});
                 assigned.insert(match);
                 auto tagged = decodeLayerTaggedUuid(uuids[i]);
                 if (tagged.tagged) applyEditorLayers(match, tagged.layer1, tagged.layer2);
@@ -1574,8 +1623,6 @@ namespace mpedit {
 
                 if (match->m_objectID == 31) {
                     if (auto* startPos = typeinfo_cast<StartPosObject*>(match)) {
-                        // createObjectsFromString normally restores this already,
-                        // but StartPos has additional runtime settings/cache state.
                         startPos->loadSettingsFromString(serializedObjects[i]);
                     }
                     updateStartPosCache(match);

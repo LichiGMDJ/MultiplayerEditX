@@ -381,38 +381,31 @@ namespace {
         auto startMsg = proto::serializeSyncLevelStart(totalChunks, totalObjects, settings);
         P2PManager::get().sendTo(targetPlayerId, startMsg, ChannelType::Reliable);
 
-        auto* seqArr = cocos2d::CCArray::create();
-        
+        // Queue the complete authoritative snapshot in one main-thread pass.
+        // P2PManager owns transport pacing; delaying here creates an ordering hole
+        // where live edits can be inserted between SyncLevel chunks.
         for (uint32_t i = 0; i < totalChunks; ++i) {
             auto chunkMsg = proto::serializeSyncLevelChunk(
-                i, 
-                reinterpret_cast<const uint8_t*>(chunks[i].objectsString.data()), 
+                i,
+                reinterpret_cast<const uint8_t*>(chunks[i].objectsString.data()),
                 chunks[i].objectsString.size(),
                 chunks[i].uuids
             );
-            
-            auto* callFunc = geode::cocos::CallFuncExt::create([targetPlayerId, chunkMsg]() {
-                P2PManager::get().sendTo(targetPlayerId, chunkMsg, ChannelType::Reliable);
-            });
-            
-            seqArr->addObject(cocos2d::CCDelayTime::create(0.01f));
-            seqArr->addObject(callFunc);
+            P2PManager::get().sendTo(targetPlayerId, chunkMsg, ChannelType::Reliable);
         }
 
-        // 6. Gather locks
+        // Keep SyncLevelEnd directly behind the chunk stream in the same FIFO.
         std::vector<ActionSerializer::LockData> locks;
         for (auto const& [uuid, lockInfo] : handler.getObjectLocks()) {
             locks.push_back({uuid, lockInfo.playerId, lockInfo.timeLeft});
         }
+        auto endMsg = proto::serializeSyncLevelEnd(locks);
+        P2PManager::get().sendTo(targetPlayerId, endMsg, ChannelType::Reliable);
 
-        auto* endFunc = geode::cocos::CallFuncExt::create([targetPlayerId, locks]() {
-            auto endMsg = proto::serializeSyncLevelEnd(locks);
-            P2PManager::get().sendTo(targetPlayerId, endMsg, ChannelType::Reliable);
-        });
-        
-        seqArr->addObject(endFunc);
-        
-        editor->runAction(cocos2d::CCSequence::create(seqArr));
+        log::info(
+            "EditorHooks: queued authoritative snapshot for player {}: {} objects, {} chunks",
+            targetPlayerId, totalObjects, totalChunks
+        );
     }
 
     // Registers UUIDs onto the editor's currently-spawned objects, aligned by

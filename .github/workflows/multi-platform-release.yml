@@ -94,7 +94,10 @@ jobs:
               "playerLimit", "hasPassword", "roomName", "description",
           ]:
               assert token in signaling, token
-          assert ".filter((room) => !room.isPrivate)" in signaling
+          assert "HOST_DIRECTORY_STALE_MS = 45_000" in signaling
+          assert "directoryNow - room.host.lastSeenAt <= HOST_DIRECTORY_STALE_MS" in signaling
+          assert "fetchRooms(false);" in discovery
+          assert "m_autoRefreshTimer" in discovery
           assert "Invalid room password" in p2p
           assert "m_pendingJoinPassword" in p2ph
           assert "unsafe popup owner access remains" not in discovery
@@ -127,7 +130,7 @@ jobs:
           assert "!candidate || !mid" not in signaling
           assert "194.226.126.115" not in p2p
 
-          print("v0.5.3 transport + room discovery + synchronization verification passed")
+          print("v0.5.3 transport + room lifecycle + synchronization verification passed")
           PY
 
       - name: Build

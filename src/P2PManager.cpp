@@ -571,7 +571,7 @@ namespace mpedit {
 
 
     void P2PManager::flushBulkReliableQueues() {
-        constexpr size_t kMaxBulkPacketsPerPeerPerTick = 3;
+        constexpr size_t kMaxBulkPacketsPerPeerPerTick = 8;
         constexpr uint64_t kAckTimeoutMs = 900;
         auto now = reliabilityNowMs();
 

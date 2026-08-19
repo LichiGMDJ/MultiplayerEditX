@@ -68,21 +68,28 @@ namespace mpedit {
             std::vector<GameObject*> newObjects;
             if (!editor || saveStr.empty()) return newObjects;
 
-            auto existing = snapshotExistingObjects(editor);
-
+            // Geometry Dash appends objects created by createObjectsFromString to
+            // m_objects. Recording the old count avoids building a set of every
+            // object and then scanning the entire level again for each remote
+            // placement. That old O(level-size) work dominated large sessions.
+            size_t beforeCount = editor->m_objects ? editor->m_objects->count() : 0;
             editor->createObjectsFromString(saveStr, true, true);
+            if (!editor->m_objects) return newObjects;
 
-            if (editor->m_objects) {
-                for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
-                    if (obj && !existing.count(obj)) {
-                        newObjects.push_back(obj);
-                    }
+            size_t afterCount = editor->m_objects->count();
+            if (afterCount <= beforeCount) return newObjects;
+            newObjects.reserve(afterCount - beforeCount);
+
+            size_t index = 0;
+            for (auto* obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+                if (obj && index >= beforeCount) {
+                    newObjects.push_back(obj);
                 }
+                ++index;
             }
             return newObjects;
         }
 
-        std::string stableIntegrityHash(std::string const& value) {
             uint64_t hash = 1469598103934665603ull;
             for (unsigned char c : value) {
                 hash ^= static_cast<uint64_t>(c);
@@ -939,6 +946,11 @@ namespace mpedit {
                         }
                     }
                     if (!obj) obj = newObjs.front();
+
+                    // The sender coordinates are authoritative. Explicitly apply
+                    // them even when GD normalizes the save string during object
+                    // creation, preventing remote placements from drifting.
+                    obj->setPosition({objData.x, objData.y});
                     
                     if (obj->m_objectID == 31) {
                         if (auto* startPos = typeinfo_cast<StartPosObject*>(obj)) {
@@ -1541,31 +1553,48 @@ namespace mpedit {
             auto newObjs = createObjectsFromSaveStringRobust(editor, objectsString);
             log::info("RemoteActionHandler: Spawned {} objects from objectsString (len={})",
                 newObjs.size(), objectsString.size());
-            // Match each authoritative serialized record to a newly-created object
-            // with the same object ID. GD may auto-create companion objects (for
-            // example teleport portal parts), so blindly zipping newObjs with UUIDs
-            // can shift every later UUID and make future deletes hit the wrong object.
+            // Match each authoritative serialized record to the recreated object
+            // with the same object ID AND nearest serialized position. Matching by
+            // object ID alone is ambiguous on real levels where hundreds of objects
+            // share the same ID and can bind UUIDs to the wrong instance.
             std::unordered_set<GameObject*> assigned;
             size_t mapped = 0;
             for (size_t i = 0; i < serializedObjects.size(); ++i) {
                 int expectedId = serializedObjectId(serializedObjects[i]);
+                auto fields = ActionSerializer::parseSaveString(serializedObjects[i]);
+                float expectedX = 0.f;
+                float expectedY = 0.f;
+                if (auto it = fields.find("2"); it != fields.end()) {
+                    expectedX = geode::utils::numFromString<float>(it->second).unwrapOr(0.f);
+                }
+                if (auto it = fields.find("3"); it != fields.end()) {
+                    expectedY = geode::utils::numFromString<float>(it->second).unwrapOr(0.f);
+                }
+
                 GameObject* match = nullptr;
+                float bestDistanceSq = 1.0e30f;
                 for (auto* candidate : newObjs) {
-                    if (!candidate || assigned.contains(candidate)) continue;
-                    if (candidate->m_objectID == expectedId) {
+                    if (!candidate || assigned.contains(candidate) || candidate->m_objectID != expectedId) continue;
+                    float dx = candidate->getPositionX() - expectedX;
+                    float dy = candidate->getPositionY() - expectedY;
+                    float distanceSq = dx * dx + dy * dy;
+                    if (distanceSq < bestDistanceSq) {
+                        bestDistanceSq = distanceSq;
                         match = candidate;
-                        break;
+                        if (distanceSq <= 0.0001f) break;
                     }
                 }
                 if (!match) {
                     log::error(
-                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={})",
-                        i,
-                        expectedId
+                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={}, x={}, y={})",
+                        i, expectedId, expectedX, expectedY
                     );
                     continue;
                 }
 
+                // Reassert the serialized position after matching. This also
+                // neutralizes small receiver-side normalization differences.
+                match->setPosition({expectedX, expectedY});
                 assigned.insert(match);
                 auto tagged = decodeLayerTaggedUuid(uuids[i]);
                 if (tagged.tagged) applyEditorLayers(match, tagged.layer1, tagged.layer2);
@@ -1574,16 +1603,13 @@ namespace mpedit {
 
                 if (match->m_objectID == 31) {
                     if (auto* startPos = typeinfo_cast<StartPosObject*>(match)) {
-                        // createObjectsFromString normally restores this already,
-                        // but StartPos has additional runtime settings/cache state.
                         startPos->loadSettingsFromString(serializedObjects[i]);
                     }
                     updateStartPosCache(match);
                 }
             }
 
-            size_t fallbackIndex = uuids.size();
-            for (auto* obj : newObjs) {
+            size_t fallbackIndex = uuids.size();            for (auto* obj : newObjs) {
                 if (!obj || assigned.contains(obj)) continue;
                 if (getUUIDForObject(obj).empty()) {
                     registerObject("sync_extra_" + std::to_string(fallbackIndex++), obj);

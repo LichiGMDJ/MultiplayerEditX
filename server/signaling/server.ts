@@ -41,6 +41,11 @@ type RateBucket = {
 
 const PORT = 8000;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
+// Hosts continuously long-poll signaling, so a host that has not touched the
+// server for this window is no longer safe to advertise in the public list.
+// The room itself may remain temporarily so an existing client can request
+// host migration after an unexpected disconnect.
+const HOST_DIRECTORY_STALE_MS = 75_000;
 const LONG_POLL_MS = 25_000;
 const RELAY_LONG_POLL_MS = 20_000;
 const MAX_QUEUE_MESSAGES = 128;
@@ -190,12 +195,16 @@ async function longPollRelay(participant: Participant): Promise<Response> {
 }
 
 function removeExpiredRooms(): void {
-  const cutoff = now() - ROOM_TTL_MS;
+  const current = now();
+  const cutoff = current - ROOM_TTL_MS;
   for (const [code, room] of rooms) {
-    if (room.lastActivityAt < cutoff) rooms.delete(code);
+    const hostStale = current - room.host.lastSeenAt > HOST_DIRECTORY_STALE_MS;
+    if (room.lastActivityAt < cutoff || (hostStale && room.clients.size === 0)) {
+      rooms.delete(code);
+    }
   }
 
-  const rateCutoff = now() - 5 * 60_000;
+  const rateCutoff = current - 5 * 60_000;
   for (const [key, bucket] of rateBuckets) {
     if (bucket.windowStart < rateCutoff) rateBuckets.delete(key);
   }
@@ -280,8 +289,12 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (req.method === "GET" && path === "/rooms") {
+    const directoryNow = now();
     const publicRooms = [...rooms.values()]
-      .filter((room) => !room.isPrivate)
+      .filter((room) =>
+        !room.isPrivate &&
+        directoryNow - room.host.lastSeenAt <= HOST_DIRECTORY_STALE_MS
+      )
       .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
       .slice(0, 100)
       .map((room) => ({
@@ -563,21 +576,29 @@ async function handle(req: Request): Promise<Response> {
 
     if (req.method === "DELETE" && parts.length === 2) {
       const token = bearerToken(req);
-      if (!token || token !== room.host.token) return json({ error: "host token required" }, 403);
+      const participant = findParticipant(room, token);
+      if (!participant) return json({ error: "unauthorized" }, 401);
 
-      const winner = electMigrationHost(room);
-      if (!winner) {
+      if (participant.token === room.host.token) {
+        // Explicit host leave/delete is authoritative. Host migration is only
+        // for an unexpected host loss handled through POST /migrate.
         rooms.delete(roomCode);
+        console.log(`[room] closed room=${roomCode} host=${room.host.playerName}`);
         return json({ ok: true, closed: true });
       }
 
-      promoteHost(room, winner);
-      return json({
-        ok: true,
-        closed: false,
-        migrated: true,
+      // Clients also unregister from signaling on a graceful leave so public
+      // player counts and future migration candidates do not retain ghosts.
+      const leavingId = participant.playerId;
+      room.clients.delete(leavingId);
+      room.lastActivityAt = now();
+      enqueue(room.host, {
+        type: "client_left",
+        playerId: leavingId,
         generation: room.generation,
       });
+      console.log(`[room] client left room=${roomCode} player=${leavingId}`);
+      return json({ ok: true, closed: false, left: true });
     }
   }
 

@@ -2,6 +2,7 @@
 #include "P2PManager.hpp"
 #include "RemoteActionHandler.hpp"
 #include "BinaryProtocol.hpp"
+#include "ui/CursorNode.hpp"
 #include <Geode/loader/Log.hpp>
 #include <Geode/loader/Mod.hpp>
 #include <Geode/Geode.hpp>
@@ -61,7 +62,19 @@ namespace mpedit {
     void SessionManager::leaveSession() {
         if (!isInSession()) return;
 
+        // The editor pause layer can suspend scheduled updates. Do not wait for
+        // CursorNode::update() to notice Role::None: remove remote cursors and
+        // playtest icons synchronously while the scene is still alive.
+        if (auto* editor = LevelEditorLayer::get()) {
+            if (editor->m_objectLayer) {
+                if (auto* cursor = typeinfo_cast<CursorNode*>(editor->m_objectLayer->getChildByID("cursor-node"_spr))) {
+                    cursor->clearRemoteVisuals();
+                }
+            }
+        }
+
         P2PManager::get().leaveSession();
+        RemoteActionHandler::get().clearMappings();
         
         auto sessionEndedCallbacks = m_onSessionEnded;
         clearNetworkHandlers();

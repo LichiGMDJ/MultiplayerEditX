@@ -1,0 +1,182 @@
+name: Apply Sync Performance Polish
+
+on:
+  push:
+    branches: [ui-layout-polish]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[perf-sync-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ui-layout-polish
+          fetch-depth: 0
+
+      - name: Apply performance fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              return text.replace(old, new, 1)
+
+          # ------------------------------------------------------------
+          # 1) Initial snapshot: remove the second artificial pacer.
+          # P2PManager already owns the ordered reliable FIFO/ACK pacing.
+          # ------------------------------------------------------------
+          path = Path("src/EditorHooks.cpp")
+          text = path.read_text(encoding="utf-8")
+          start = text.index("        auto* seqArr = cocos2d::CCArray::create();")
+          end_marker = "        editor->runAction(cocos2d::CCSequence::create(seqArr));\n"
+          end = text.index(end_marker, start) + len(end_marker)
+          replacement = '''        // The transport layer already owns ordered reliable pacing. Queue the\n        // complete snapshot immediately instead of inserting a Cocos delay before\n        // every chunk; the FIFO preserves Start -> Chunk[n] -> End ordering.\n        for (uint32_t i = 0; i < totalChunks; ++i) {\n            auto chunkMsg = proto::serializeSyncLevelChunk(\n                i,\n                reinterpret_cast<const uint8_t*>(chunks[i].objectsString.data()),\n                chunks[i].objectsString.size(),\n                chunks[i].uuids\n            );\n            P2PManager::get().sendTo(targetPlayerId, chunkMsg, ChannelType::Reliable);\n        }\n\n        std::vector<ActionSerializer::LockData> locks;\n        for (auto const& [uuid, lockInfo] : handler.getObjectLocks()) {\n            locks.push_back({uuid, lockInfo.playerId, lockInfo.timeLeft});\n        }\n\n        auto endMsg = proto::serializeSyncLevelEnd(locks);\n        P2PManager::get().sendTo(targetPlayerId, endMsg, ChannelType::Reliable);\n        log::info(\n            "EditorHooks: queued authoritative snapshot immediately: player={} chunks={} objects={} compressedBytes={}",\n            targetPlayerId, totalChunks, totalObjects, compressedBytes.size()\n        );\n'''
+          text = text[:start] + replacement + text[end:]
+          path.write_text(text, encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 2) Transport throughput / startup latency.
+          # ------------------------------------------------------------
+          path = Path("src/P2PManager.cpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "        constexpr size_t kMaxBulkPacketsPerPeerPerTick = 3;",
+              "        constexpr size_t kMaxBulkPacketsPerPeerPerTick = 8;",
+              "WebRTC reliable burst budget"
+          )
+          text = replace_once(
+              text,
+              "            std::this_thread::sleep_for(std::chrono::seconds(8));",
+              "            std::this_thread::sleep_for(std::chrono::seconds(3));",
+              "Auto HTTP relay fallback latency"
+          )
+          relay_log = '''                } else if (trackedSequence != 0) {\n                    log::debug(\n                        "P2PManager: HTTP relay accepted reliable sequence #{} for player {}",\n                        trackedSequence, playerId\n                    );\n                }\n'''
+          relay_log_new = relay_log + '''\n                // Do not wait for the next 50 ms editor network tick after an\n                // accepted relay POST. Continue draining the ordered FIFO as soon\n                // as the server has accepted the previous packet. Failed POSTs\n                // deliberately keep the normal retry/backoff path.\n                if (res.ok() && trackedSequence != 0) {\n                    queueInMainThread([this]() { flushBulkReliableQueues(); });\n                }\n'''
+          text = replace_once(text, relay_log, relay_log_new, "HTTP relay eager FIFO drain")
+          path.write_text(text, encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 3) Snapshot apply: replace O(objects^2) UUID matching with ID buckets.
+          # ------------------------------------------------------------
+          path = Path("src/RemoteActionHandler.cpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "#include <algorithm>\n#include <unordered_set>",
+              "#include <algorithm>\n#include <chrono>\n#include <unordered_set>",
+              "chrono include"
+          )
+
+          old_id = '''        int serializedObjectId(std::string const& saveString) {\n            auto fields = ActionSerializer::parseSaveString(saveString);\n            auto it = fields.find("1");\n            if (it == fields.end()) return 0;\n            return geode::utils::numFromString<int>(it->second).unwrapOr(0);\n        }'''
+          new_id = '''        int serializedObjectId(std::string const& saveString) {\n            // Object save strings normally begin with key 1 (object ID). Avoid\n            // constructing a full key/value map for every object in a snapshot.\n            auto firstComma = saveString.find(',');\n            if (firstComma != std::string::npos && saveString.substr(0, firstComma) == "1") {\n                auto secondComma = saveString.find(',', firstComma + 1);\n                auto value = saveString.substr(\n                    firstComma + 1,\n                    secondComma == std::string::npos\n                        ? std::string::npos\n                        : secondComma - firstComma - 1\n                );\n                return geode::utils::numFromString<int>(value).unwrapOr(0);\n            }\n\n            // Defensive compatibility fallback for unusual save strings.\n            auto fields = ActionSerializer::parseSaveString(saveString);\n            auto it = fields.find("1");\n            if (it == fields.end()) return 0;\n            return geode::utils::numFromString<int>(it->second).unwrapOr(0);\n        }'''
+          text = replace_once(text, old_id, new_id, "fast object ID parser")
+
+          log_line = '''        log::info("RemoteActionHandler: sync_level received (playerId={}, objectsStringLen={}, uuids={}, settingsLen={}, locks={}, pending={})",\n            playerId, objectsString.size(), uuids.size(), settings.saveString.size(), locks.size(), isPendingSync);'''
+          text = replace_once(
+              text,
+              log_line,
+              '''        auto syncApplyStartedAt = std::chrono::steady_clock::now();\n        log::info("RemoteActionHandler: sync_level received (playerId={}, objectsStringLen={}, uuids={}, settingsLen={}, locks={}, pending={})",\n            playerId, objectsString.size(), uuids.size(), settings.saveString.size(), locks.size(), isPendingSync);''',
+              "sync apply timer"
+          )
+
+          map_start = text.index("            std::unordered_set<GameObject*> assigned;")
+          map_end = text.index("            size_t fallbackIndex = uuids.size();", map_start)
+          fast_map = '''            // Bucket spawned objects by object ID once. The previous implementation\n            // scanned every spawned object for every serialized record (O(n^2)),\n            // which dominated large-level startup. Relative order inside each ID\n            // bucket stays the same as GD created it, preserving duplicate IDs and\n            // auto-created companion objects without quadratic searching.\n            std::unordered_map<int, std::vector<GameObject*>> spawnedById;\n            spawnedById.reserve(newObjs.size());\n            for (auto* candidate : newObjs) {\n                if (candidate) spawnedById[candidate->m_objectID].push_back(candidate);\n            }\n            std::unordered_map<int, size_t> nextById;\n            nextById.reserve(spawnedById.size());\n            std::unordered_set<GameObject*> assigned;\n            assigned.reserve(std::min(newObjs.size(), serializedObjects.size()));\n\n            size_t mapped = 0;\n            for (size_t i = 0; i < serializedObjects.size(); ++i) {\n                int expectedId = serializedObjectId(serializedObjects[i]);\n                GameObject* match = nullptr;\n\n                auto bucketIt = spawnedById.find(expectedId);\n                if (bucketIt != spawnedById.end()) {\n                    auto& cursor = nextById[expectedId];\n                    auto& bucket = bucketIt->second;\n                    if (cursor < bucket.size()) {\n                        match = bucket[cursor++];\n                    }\n                }\n\n                if (!match) {\n                    log::error(\n                        "RemoteActionHandler: no recreated object matched snapshot record {} (objectID={})",\n                        i,\n                        expectedId\n                    );\n                    continue;\n                }\n\n                assigned.insert(match);\n                auto tagged = decodeLayerTaggedUuid(uuids[i]);\n                if (tagged.tagged) applyEditorLayers(match, tagged.layer1, tagged.layer2);\n                registerObject(tagged.uuid, match);\n                ++mapped;\n\n                if (match->m_objectID == 31) {\n                    if (auto* startPos = typeinfo_cast<StartPosObject*>(match)) {\n                        startPos->loadSettingsFromString(serializedObjects[i]);\n                    }\n                    updateStartPosCache(match);\n                }\n            }\n\n'''
+          text = text[:map_start] + fast_map + text[map_end:]
+
+          old_done = '''        log::info("RemoteActionHandler: sync_level complete (final m_objects count = {})",\n            editor->m_objects ? editor->m_objects->count() : 0);'''
+          new_done = '''        auto syncApplyMs = std::chrono::duration_cast<std::chrono::milliseconds>(\n            std::chrono::steady_clock::now() - syncApplyStartedAt\n        ).count();\n        log::info(\n            "RemoteActionHandler: sync_level complete (final m_objects count = {}, applyMs={})",\n            editor->m_objects ? editor->m_objects->count() : 0,\n            syncApplyMs\n        );'''
+          text = replace_once(text, old_done, new_done, "sync apply timing log")
+          path.write_text(text, encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 4) Public room browser: refresh silently instead of holding stale UI.
+          # ------------------------------------------------------------
+          path = Path("src/ui/RoomDiscoveryPopups.hpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''    std::size_t m_page = 0;\n    geode::async::TaskHolder<geode::utils::web::WebResponse> m_request;\n\n    bool setup();\n    void fetchRooms();''',
+              '''    std::size_t m_page = 0;\n    geode::async::TaskHolder<geode::utils::web::WebResponse> m_request;\n    bool m_fetchInFlight = false;\n    float m_autoRefreshTimer = 0.f;\n\n    bool setup();\n    void update(float dt) override;\n    void fetchRooms(bool showLoading = true);''',
+              "room browser refresh state"
+          )
+          path.write_text(text, encoding="utf-8")
+
+          path = Path("src/ui/RoomDiscoveryPopups.cpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''    fetchRooms();\n    return true;\n}\n\nvoid RoomBrowserPopup::fetchRooms() {\n    if (!m_body) return;\n    m_rooms.clear();\n    m_page = 0;\n    m_body->removeAllChildren();\n\n    auto center = m_mainLayer->getContentSize() / 2.f;\n    m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);''',
+              '''    fetchRooms();\n    this->scheduleUpdate();\n    return true;\n}\n\nvoid RoomBrowserPopup::update(float dt) {\n    m_autoRefreshTimer += dt;\n    if (m_autoRefreshTimer < 4.f) return;\n    m_autoRefreshTimer = 0.f;\n    fetchRooms(false);\n}\n\nvoid RoomBrowserPopup::fetchRooms(bool showLoading) {\n    if (!m_body || m_fetchInFlight) return;\n    m_fetchInFlight = true;\n    if (showLoading) {\n        m_page = 0;\n        m_body->removeAllChildren();\n        auto center = m_mainLayer->getContentSize() / 2.f;\n        m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);\n    }''',
+              "room browser periodic refresh"
+          )
+          text = replace_once(
+              text,
+              '''    m_request.spawn(req.get(url), [this, url](web::WebResponse res) {\n        if (!m_body) return;\n        if (!res.ok()) {''',
+              '''    m_request.spawn(req.get(url), [this, url, showLoading](web::WebResponse res) {\n        m_fetchInFlight = false;\n        if (!m_body) return;\n        if (!res.ok()) {''',
+              "room browser callback state"
+          )
+          text = replace_once(
+              text,
+              '''            m_body->removeAllChildren();\n            m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n            m_statusLabel->setColor({255, 120, 120});\n            return;''',
+              '''            if (showLoading) {\n                m_body->removeAllChildren();\n                m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n                m_statusLabel->setColor({255, 120, 120});\n            }\n            return;''',
+              "silent refresh error handling"
+          )
+          text = replace_once(
+              text,
+              '''        for (std::size_t i = 0; i < json.size(); ++i) {''',
+              '''        std::vector<BrowserRoomInfo> freshRooms;\n        freshRooms.reserve(json.size());\n        for (std::size_t i = 0; i < json.size(); ++i) {''',
+              "fresh room list"
+          )
+          text = replace_once(
+              text,
+              '''            if (!room.roomCode.empty()) m_rooms.push_back(std::move(room));\n        }\n        rebuild();''',
+              '''            if (!room.roomCode.empty()) freshRooms.push_back(std::move(room));\n        }\n        m_rooms = std::move(freshRooms);\n        rebuild();''',
+              "atomic room list replacement"
+          )
+          path.write_text(text, encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 5) Signaling directory liveness: quicker hide after host loss.
+          # Graceful DELETE remains immediate; migration-capable rooms with clients
+          # are retained internally but not advertised while the host is stale.
+          # ------------------------------------------------------------
+          path = Path("server/signaling/server.ts")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "const HOST_DIRECTORY_STALE_MS = 75_000;",
+              "const HOST_DIRECTORY_STALE_MS = 45_000;",
+              "host directory stale window"
+          )
+          path.write_text(text, encoding="utf-8")
+
+      - name: Validate performance invariants
+        run: |
+          grep -F 'queued authoritative snapshot immediately' src/EditorHooks.cpp
+          ! grep -F 'CCDelayTime::create(0.01f)' src/EditorHooks.cpp
+          grep -F 'kMaxBulkPacketsPerPeerPerTick = 8' src/P2PManager.cpp
+          grep -F 'std::chrono::seconds(3)' src/P2PManager.cpp
+          grep -F 'flushBulkReliableQueues();' src/P2PManager.cpp
+          grep -F 'spawnedById' src/RemoteActionHandler.cpp
+          grep -F 'sync_level complete (final m_objects count = {}, applyMs={})' src/RemoteActionHandler.cpp
+          grep -F 'void update(float dt) override;' src/ui/RoomDiscoveryPopups.hpp
+          grep -F 'fetchRooms(false);' src/ui/RoomDiscoveryPopups.cpp
+          grep -F 'HOST_DIRECTORY_STALE_MS = 45_000' server/signaling/server.ts
+          deno check server/signaling/server.ts
+
+      - name: Commit fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/EditorHooks.cpp src/P2PManager.cpp src/RemoteActionHandler.cpp src/ui/RoomDiscoveryPopups.hpp src/ui/RoomDiscoveryPopups.cpp server/signaling/server.ts
+          git commit -m "perf: accelerate initial sync and room discovery [perf-sync-applied]"
+          git push origin HEAD:ui-layout-polish

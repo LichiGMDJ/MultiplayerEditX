@@ -39,13 +39,25 @@ namespace mpedit {
         return true;
     }
 
+    void CursorNode::clearRemoteVisuals() {
+        for (auto& [playerId, cursor] : m_cursors) {
+            (void)playerId;
+            if (cursor.drawNode) cursor.drawNode->removeFromParent();
+            if (cursor.label) cursor.label->removeFromParent();
+            if (cursor.toolIndicator) cursor.toolIndicator->removeFromParent();
+            if (cursor.playtestIcon) cursor.playtestIcon->removeFromParent();
+            if (cursor.playtestIcon2) cursor.playtestIcon2->removeFromParent();
+        }
+        m_cursors.clear();
+        if (m_selectionDrawNode) m_selectionDrawNode->clear();
+        log::debug("CursorNode: cleared all remote cursor/player visuals");
+    }
+
     void CursorNode::update(float dt) {
         auto& session = SessionManager::get();
         
         if (!session.isInSession()) {
-            this->removeAllChildren();
-            m_cursors.clear();
-            m_selectionDrawNode = nullptr; // Since removeAllChildren deleted it
+            clearRemoteVisuals();
             return;
         }
         

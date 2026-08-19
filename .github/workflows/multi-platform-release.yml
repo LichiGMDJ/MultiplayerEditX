@@ -34,6 +34,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Apply test sync performance patch
+        shell: bash
+        run: python .ci/perf_sync_patch.py
+
       - name: Verify source architecture
         shell: bash
         run: |
@@ -55,6 +59,9 @@ jobs:
           remote = Path("src/RemoteActionHandler.cpp").read_text(encoding="utf-8")
           popup = Path("src/ui/MultiplayerPopup.cpp").read_text(encoding="utf-8")
           discovery = Path("src/ui/RoomDiscoveryPopups.cpp").read_text(encoding="utf-8")
+          cursor = Path("src/ui/CursorNode.cpp").read_text(encoding="utf-8")
+          cursor_h = Path("src/ui/CursorNode.hpp").read_text(encoding="utf-8")
+          session = Path("src/SessionManager.cpp").read_text(encoding="utf-8")
           capabilities = Path("src/net/ProtocolCapabilities.hpp").read_text(encoding="utf-8")
           network = Path("src/net/NetworkConfig.hpp").read_text(encoding="utf-8")
           signaling = Path("server/signaling/server.ts").read_text(encoding="utf-8")
@@ -81,11 +88,25 @@ jobs:
           assert "signaling POST {} failed" in p2p
           assert "requestHostMigration" in p2p
 
+          # Performance regression guards for this test build.
+          assert "kMaxBulkPacketsPerPeerPerTick = 8" in p2p
+          assert "std::chrono::seconds(3)" in p2p
+          assert "queueInMainThread([this]() { flushBulkReliableQueues(); });" in p2p
+          assert "queued authoritative snapshot immediately" in hooks
+          assert "CCDelayTime::create(0.01f)" not in hooks
+          assert "spawnedById" in remote
+          assert "applyMs={}" in remote
+          assert "fetchRooms(false);" in discovery
+          assert "HOST_DIRECTORY_STALE_MS = 45_000" in signaling
+
           # Room discovery / privacy / password UI and API.
           for token in ["Public Rooms", "Private Room", "CreateRoomPopup", "RoomBrowserPopup"]:
               assert token in (popup + discovery), token
           for token in ["Password Required", "Room name", "Player limit", "hasPassword"]:
               assert token in discovery, token
+          assert "constexpr int kDiscoveryButtonWidth = 176" in popup
+          assert 'ButtonSprite::create("Public", 88' in discovery
+          assert "serverLabel->setScale(0.62f)" in popup
           assert "patreon.com" not in popup.lower()
           assert "Patreon" not in popup
           assert not Path(".github/FUNDING.yml").exists()
@@ -94,11 +115,25 @@ jobs:
               "playerLimit", "hasPassword", "roomName", "description",
           ]:
               assert token in signaling, token
-          assert ".filter((room) => !room.isPrivate)" in signaling
+          assert "directoryNow - room.host.lastSeenAt <= HOST_DIRECTORY_STALE_MS" in signaling
+          assert "Explicit host leave/delete is authoritative" in signaling
+          assert 'type: "client_left"' in signaling
+          assert "signaling reports graceful leave for player" in p2p
+          assert "Room closed by host" in p2p
+          assert "Tell signaling first, while the peer connections are still alive." in p2p
           assert "Invalid room password" in p2p
           assert "m_pendingJoinPassword" in p2ph
           assert "unsafe popup owner access remains" not in discovery
           assert 'this->onClose(nullptr);\n    m_owner->' not in discovery
+
+          # Session visuals and music metadata cleanup.
+          assert "void clearRemoteVisuals();" in cursor_h
+          assert "CursorNode: cleared all remote cursor/player visuals" in cursor
+          assert "cursor->clearRemoteVisuals();" in session
+          assert "RemoteActionHandler::get().clearMappings();" in session
+          assert "resolveLevelMusicTitle" in hooks
+          assert "level->getSongName()" in hooks
+          assert "cursor music label resolved to" in hooks
 
           # Level/object synchronization must survive networking/UI refactors.
           for token in [
@@ -127,7 +162,7 @@ jobs:
           assert "!candidate || !mid" not in signaling
           assert "194.226.126.115" not in p2p
 
-          print("v0.5.3 transport + room discovery + synchronization verification passed")
+          print("v0.5.3 performance + transport + room lifecycle + synchronization verification passed")
           PY
 
       - name: Build

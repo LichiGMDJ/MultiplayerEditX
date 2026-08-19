@@ -1,0 +1,34 @@
+name: Apply public room lifecycle fix
+
+on:
+  push:
+    branches:
+      - agent/public-room-lifecycle-fix
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/public-room-lifecycle-fix
+          fetch-depth: 0
+      - name: Apply lifecycle patch
+        run: python3 tools/apply_public_room_lifecycle_fix.py
+      - name: Validate
+        run: |
+          git diff --check
+          grep -q 'HOST_DIRECTORY_STALE_MS = 45_000' server/signaling/server.ts
+          grep -q 'fetchRooms(false);' src/ui/RoomDiscoveryPopups.cpp
+          grep -q 'm_autoRefreshTimer' src/ui/RoomDiscoveryPopups.hpp
+      - name: Commit source changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/signaling/server.ts src/ui/RoomDiscoveryPopups.cpp src/ui/RoomDiscoveryPopups.hpp
+          git commit -m "fix: remove stale rooms from public browser"
+          git push origin HEAD:agent/public-room-lifecycle-fix

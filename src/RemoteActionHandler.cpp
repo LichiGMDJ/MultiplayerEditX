@@ -90,6 +90,7 @@ namespace mpedit {
             return newObjects;
         }
 
+        std::string stableIntegrityHash(std::string const& value) {
             uint64_t hash = 1469598103934665603ull;
             for (unsigned char c : value) {
                 hash ^= static_cast<uint64_t>(c);

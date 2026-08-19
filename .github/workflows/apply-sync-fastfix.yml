@@ -31,11 +31,12 @@ jobs:
           grep -q 'queued authoritative snapshot for player' src/EditorHooks.cpp
           grep -q 'nearest serialized position' src/RemoteActionHandler.cpp
           grep -q 'obj->setPosition({objData.x, objData.y})' src/RemoteActionHandler.cpp
+          grep -q 'std::string stableIntegrityHash(std::string const& value)' src/RemoteActionHandler.cpp
 
       - name: Commit patched sources
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/P2PManager.cpp src/EditorHooks.cpp src/RemoteActionHandler.cpp
-          git commit -m "fix: restore fast ordered level sync"
+          git commit -m "fix: repair and finalize fast ordered sync"
           git push origin HEAD:agent/sync-fastfix

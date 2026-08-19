@@ -2297,12 +2297,13 @@ namespace mpedit {
             m_peers.clear();
         }
 
-        if (m_role == Role::Host && !m_roomCode.empty()) {
+        // Every participant explicitly leaves the signaling directory.
+        // Previously only the host sent DELETE, so departed guests remained in
+        // room.clients and could later be elected as a ghost migration host.
+        if (m_role != Role::None && !m_roomCode.empty() && !m_signalingToken.empty()) {
             auto url = getSignalingUrl() + "/rooms/" + m_roomCode;
             auto req = web::WebRequest();
-            if (!m_signalingToken.empty()) {
-                req.header("Authorization", "Bearer " + m_signalingToken);
-            }
+            req.header("Authorization", "Bearer " + m_signalingToken);
             async::spawn(req.send("DELETE", url));
         }
 

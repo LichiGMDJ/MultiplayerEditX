@@ -575,7 +575,17 @@ async function handle(req: Request): Promise<Response> {
 
     if (req.method === "DELETE" && parts.length === 2) {
       const token = bearerToken(req);
-      if (!token || token !== room.host.token) return json({ error: "host token required" }, 403);
+      const participant = findParticipant(room, token);
+      if (!participant) return json({ error: "unauthorized" }, 401);
+
+      // Guests must be removed from the signaling roster as soon as they press
+      // Leave. Otherwise a later host leave may migrate the room to a client
+      // that is no longer connected, leaving a ghost public room behind.
+      if (participant.token !== room.host.token) {
+        room.clients.delete(participant.playerId);
+        touch(room);
+        return json({ ok: true, left: true });
+      }
 
       const winner = electMigrationHost(room);
       if (!winner) {

@@ -175,6 +175,11 @@ namespace mpedit {
             bool connectionAnnounced = false;
             bool httpRelay = false;
             bool httpRelayPostInFlight = false;
+            // CursorUpdate is latest-state data. Over HTTP relay, keep at most
+            // one POST in flight and one replacement packet so 30 Hz cursor
+            // traffic cannot build an unbounded request/backlog queue.
+            bool httpRelayCursorPostInFlight = false;
+            std::vector<uint8_t> pendingHttpRelayCursor;
             std::vector<PendingCandidate> pendingCandidates;
         };
 
@@ -197,6 +202,7 @@ namespace mpedit {
             ChannelType channel,
             uint32_t trackedSequence = 0
         );
+        void sendHttpRelayCursorPacket(int playerId, std::vector<uint8_t> const& data);
         void handleHttpRelayMessages(matjson::Value const& messages);
         void activateHttpRelayForPeer(int playerId);
         void scheduleHttpRelayFallback(int playerId);

@@ -64,7 +64,7 @@ bool CreateRoomPopup::setup() {
     m_descriptionInput->setMaxCharCount(64);
     m_mainLayer->addChild(m_descriptionInput);
 
-    makeLabel("Player limit", 0.4f, {center.width - 105.f, center.height - 10.f}, m_mainLayer);
+    makeLabel("Player limit", 0.52f, {center.width - 102.f, center.height - 10.f}, m_mainLayer);
     m_limitInput = TextInput::create(54.f, "8", "chatFont.fnt");
     m_limitInput->setPosition({center.width - 25.f, center.height - 10.f});
     m_limitInput->setFilter("0123456789");
@@ -76,7 +76,7 @@ bool CreateRoomPopup::setup() {
     menu->setPosition({0.f, 0.f});
     m_mainLayer->addChild(menu);
 
-    m_visibilitySprite = ButtonSprite::create("Public", 105, true, "bigFont.fnt", "GJ_button_04.png", 28.f, 0.5f);
+    m_visibilitySprite = ButtonSprite::create("Public", 88, true, "bigFont.fnt", "GJ_button_04.png", 24.f, 0.46f);
     auto* visibility = CCMenuItemSpriteExtra::create(
         m_visibilitySprite, this, menu_selector(CreateRoomPopup::onVisibility)
     );
@@ -94,9 +94,9 @@ bool CreateRoomPopup::setup() {
     menu->addChild(create);
 
     auto* hint = makeLabel(
-        "Private rooms are hidden from the public browser",
-        0.3f,
-        {center.width, 68.f},
+        "Private rooms are hidden\nfrom the public browser",
+        0.56f,
+        {center.width, 70.f},
         m_mainLayer
     );
     hint->setColor({180, 180, 180});
@@ -318,7 +318,7 @@ void RoomBrowserPopup::rebuild() {
     m_body->removeAllChildren();
     auto center = m_mainLayer->getContentSize() / 2.f;
 
-    auto* serverLabel = makeLabel(P2PManager::getSignalingUrl().c_str(), 0.25f, {center.width, 255.f}, m_body);
+    auto* serverLabel = makeLabel(P2PManager::getSignalingUrl().c_str(), 0.48f, {center.width - 32.f, 255.f}, m_body);
     serverLabel->setColor({160, 160, 160});
 
     auto* menu = CCMenu::create();
@@ -355,7 +355,7 @@ void RoomBrowserPopup::rebuild() {
         titleLabel->setAnchorPoint({0.f, 0.5f});
 
         auto details = fmt::format("{}  {}/{}  {}", room.hostName, room.playerCount, room.playerLimit, room.transportMode);
-        auto* detailsLabel = makeLabel(details.c_str(), 0.25f, {48.f, y - 8.f}, m_body);
+        auto* detailsLabel = makeLabel(details.c_str(), 0.34f, {48.f, y - 8.f}, m_body);
         detailsLabel->setAnchorPoint({0.f, 0.5f});
         detailsLabel->setColor({175, 175, 175});
 
@@ -366,7 +366,7 @@ void RoomBrowserPopup::rebuild() {
     }
 
     auto pageText = fmt::format("Page {}/{}", m_page + 1, maxPage + 1);
-    makeLabel(pageText.c_str(), 0.3f, {center.width, 32.f}, m_body);
+    makeLabel(pageText.c_str(), 0.42f, {center.width, 32.f}, m_body);
 
     if (m_page > 0) {
         auto* prev = makeButton("<", this, menu_selector(RoomBrowserPopup::onPrev), 42.f, "GJ_button_04.png");

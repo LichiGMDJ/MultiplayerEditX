@@ -513,6 +513,24 @@ namespace mpedit {
                 );
                 return;
             }
+
+            if (
+                channel == ChannelType::Unreliable &&
+                !data.empty() &&
+                data[0] == static_cast<uint8_t>(proto::Opcode::CursorUpdate)
+            ) {
+                // CursorUpdate describes current state, not a delta. If the relay
+                // POST is still in flight, replace the pending packet with the
+                // newest cursor position instead of starting another HTTP request.
+                if (peer.httpRelayCursorPostInFlight) {
+                    peer.pendingHttpRelayCursor = data;
+                    return;
+                }
+                peer.httpRelayCursorPostInFlight = true;
+                sendHttpRelayCursorPacket(playerId, data);
+                return;
+            }
+
             sendHttpRelayPacket(playerId, data, channel);
             return;
         }
@@ -752,19 +770,24 @@ namespace mpedit {
             if (it != m_peers.end()) {
                 protocolVerified = it->second.protocolVerified;
                 if (!protocolVerified) {
-                    if (it->second.preHandshakeMessages.size() < kMaxPreHandshakeMessages) {
-                        it->second.preHandshakeMessages.emplace_back(data, data + len);
-                        log::debug(
-                            "P2PManager: buffered opcode {} from player {} until protocol handshake",
-                            static_cast<int>(opcode),
-                            fromPlayerId
-                        );
-                    } else {
-                        log::warn(
-                            "P2PManager: pre-handshake queue full for player {}; dropping opcode {}",
-                            fromPlayerId,
-                            static_cast<int>(opcode)
-                        );
+                    const bool transientUnreliable =
+                        opcode == static_cast<uint8_t>(proto::Opcode::CursorUpdate) ||
+                        opcode == static_cast<uint8_t>(proto::Opcode::MoveBatch);
+                    if (!transientUnreliable) {
+                        if (it->second.preHandshakeMessages.size() < kMaxPreHandshakeMessages) {
+                            it->second.preHandshakeMessages.emplace_back(data, data + len);
+                            log::debug(
+                                "P2PManager: buffered opcode {} from player {} until protocol handshake",
+                                static_cast<int>(opcode),
+                                fromPlayerId
+                            );
+                        } else {
+                            log::warn(
+                                "P2PManager: pre-handshake queue full for player {}; dropping opcode {}",
+                                fromPlayerId,
+                                static_cast<int>(opcode)
+                            );
+                        }
                     }
                 }
             }
@@ -2101,6 +2124,57 @@ namespace mpedit {
                         "P2PManager: HTTP relay accepted reliable sequence #{} for player {}",
                         trackedSequence, playerId
                     );
+                }
+            }
+        );
+    }
+
+    void P2PManager::sendHttpRelayCursorPacket(
+        int playerId,
+        std::vector<uint8_t> const& data
+    ) {
+        if (data.empty() || m_signalingToken.empty() || getRoomCode().empty()) return;
+
+        auto body = matjson::Value();
+        body["targetPlayerId"] = playerId;
+        body["channel"] = "unreliable";
+        body["payload"] = bytesToHex(data);
+
+        auto req = web::WebRequest();
+        req.header("Content-Type", "application/json");
+        req.header("Authorization", "Bearer " + m_signalingToken);
+        req.bodyJSON(body);
+        auto url = getSignalingUrl() + "/rooms/" + getRoomCode() + "/relay";
+
+        async::spawn(
+            req.post(url),
+            [this, playerId](web::WebResponse res) {
+                std::vector<uint8_t> nextCursor;
+                {
+                    std::lock_guard lock(m_peersMutex);
+                    auto it = m_peers.find(playerId);
+                    if (it != m_peers.end()) {
+                        auto& peer = it->second;
+                        if (!peer.pendingHttpRelayCursor.empty()) {
+                            nextCursor = std::move(peer.pendingHttpRelayCursor);
+                            peer.pendingHttpRelayCursor.clear();
+                            // Keep httpRelayCursorPostInFlight=true while the
+                            // replacement packet is sent below.
+                        } else {
+                            peer.httpRelayCursorPostInFlight = false;
+                        }
+                    }
+                }
+
+                if (!res.ok()) {
+                    log::debug(
+                        "P2PManager: HTTP relay cursor POST to player {} failed code={} error={}",
+                        playerId, res.code(), res.errorMessage()
+                    );
+                }
+
+                if (!nextCursor.empty()) {
+                    sendHttpRelayCursorPacket(playerId, nextCursor);
                 }
             }
         );

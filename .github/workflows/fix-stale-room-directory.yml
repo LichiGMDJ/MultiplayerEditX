@@ -1,0 +1,82 @@
+name: Apply Stale Room Directory Fix
+
+on:
+  push:
+    branches: [ui-layout-polish]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[stale-room-fix-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ui-layout-polish
+          fetch-depth: 0
+
+      - name: Apply stale room fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected 1 match, got {count}")
+              return text.replace(old, new, 1)
+
+          # Server: public directory should stop advertising a host shortly after
+          # its signaling heartbeat disappears. 45s is safely above one 25s
+          # long-poll cycle without leaving zombie rooms visible for minutes.
+          path = Path("server/signaling/server.ts")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              'const HOST_DIRECTORY_STALE_MS = 75_000;',
+              'const HOST_DIRECTORY_STALE_MS = 45_000;',
+              'host directory stale timeout'
+          )
+          path.write_text(text, encoding="utf-8")
+
+          # Browser state: refresh automatically and never keep a deleted room
+          # rendered just because the popup stayed open.
+          path = Path("src/ui/RoomDiscoveryPopups.hpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''    std::size_t m_page = 0;\n    geode::async::TaskHolder<geode::utils::web::WebResponse> m_request;\n\n    bool setup();\n    void fetchRooms();''',
+              '''    std::size_t m_page = 0;\n    geode::async::TaskHolder<geode::utils::web::WebResponse> m_request;\n    bool m_hasLoadedOnce = false;\n    bool m_requestInFlight = false;\n\n    bool setup();\n    void fetchRooms();\n    void autoRefresh(float);''',
+              'room browser state'
+          )
+          path.write_text(text, encoding="utf-8")
+
+          path = Path("src/ui/RoomDiscoveryPopups.cpp")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''bool RoomBrowserPopup::setup() {\n    this->setTitle("Public Rooms", "goldFont.fnt", 0.75f, 18.f);\n    m_body = CCNode::create();\n    m_mainLayer->addChild(m_body);\n    fetchRooms();\n    return true;\n}\n\nvoid RoomBrowserPopup::fetchRooms() {\n    if (!m_body) return;\n    m_rooms.clear();\n    m_page = 0;\n    m_body->removeAllChildren();\n\n    auto center = m_mainLayer->getContentSize() / 2.f;\n    m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);\n\n    auto url = P2PManager::getSignalingUrl() + "/rooms";\n    auto req = web::WebRequest();\n    req.timeout(std::chrono::seconds(10));\n    m_request.spawn(req.get(url), [this, url](web::WebResponse res) {\n        if (!m_body) return;\n        if (!res.ok()) {\n            log::warn("RoomBrowserPopup: GET {} failed code={} error={}", url, res.code(), res.errorMessage());\n            m_body->removeAllChildren();\n            m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n            m_statusLabel->setColor({255, 120, 120});\n            return;\n        }\n\n        auto json = res.json().unwrapOr(matjson::Value());\n        if (!json.isArray()) {\n            m_body->removeAllChildren();\n            m_statusLabel = makeLabel("Invalid server response", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n            return;\n        }\n\n        for (std::size_t i = 0; i < json.size(); ++i) {\n            auto itemResult = json.get(i);\n            if (!itemResult.isOk()) continue;\n            auto item = itemResult.unwrap();\n            BrowserRoomInfo room;\n            room.roomCode = item.get<std::string>("roomCode").unwrapOr("");\n            room.roomName = item.get<std::string>("roomName").unwrapOr("Untitled Room");\n            room.description = item.get<std::string>("description").unwrapOr("");\n            room.hostName = item.get<std::string>("hostName").unwrapOr("Host");\n            room.playerCount = item.get<int>("playerCount").unwrapOr(1);\n            room.playerLimit = item.get<int>("playerLimit").unwrapOr(8);\n            room.hasPassword = item.get<bool>("hasPassword").unwrapOr(false);\n            room.transportMode = item.get<std::string>("transportMode").unwrapOr("auto");\n            if (!room.roomCode.empty()) m_rooms.push_back(std::move(room));\n        }\n        rebuild();\n    });\n}\n''',
+              '''bool RoomBrowserPopup::setup() {\n    this->setTitle("Public Rooms", "goldFont.fnt", 0.75f, 18.f);\n    m_body = CCNode::create();\n    m_mainLayer->addChild(m_body);\n    fetchRooms();\n\n    // Keep the directory live while the popup is open. A host that leaves or\n    // deletes its room disappears without requiring the user to close/reopen\n    // this popup or press Refresh manually.\n    this->schedule(schedule_selector(RoomBrowserPopup::autoRefresh), 4.f);\n    return true;\n}\n\nvoid RoomBrowserPopup::autoRefresh(float) {\n    fetchRooms();\n}\n\nvoid RoomBrowserPopup::fetchRooms() {\n    if (!m_body || m_requestInFlight) return;\n    m_requestInFlight = true;\n\n    if (!m_hasLoadedOnce) {\n        m_rooms.clear();\n        m_page = 0;\n        m_body->removeAllChildren();\n        auto center = m_mainLayer->getContentSize() / 2.f;\n        m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);\n    }\n\n    auto url = P2PManager::getSignalingUrl() + "/rooms";\n    auto req = web::WebRequest();\n    req.timeout(std::chrono::seconds(10));\n    m_request.spawn(req.get(url), [this, url](web::WebResponse res) {\n        m_requestInFlight = false;\n        if (!m_body) return;\n        if (!res.ok()) {\n            log::warn("RoomBrowserPopup: GET {} failed code={} error={}", url, res.code(), res.errorMessage());\n            // A transient background refresh must not destroy an already-valid\n            // directory view. Only the initial load gets a visible error state.\n            if (!m_hasLoadedOnce) {\n                m_body->removeAllChildren();\n                m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n                m_statusLabel->setColor({255, 120, 120});\n            }\n            return;\n        }\n\n        auto json = res.json().unwrapOr(matjson::Value());\n        if (!json.isArray()) {\n            log::warn("RoomBrowserPopup: GET {} returned a non-array directory", url);\n            if (!m_hasLoadedOnce) {\n                m_body->removeAllChildren();\n                m_statusLabel = makeLabel("Invalid server response", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);\n            }\n            return;\n        }\n\n        std::vector<BrowserRoomInfo> fetchedRooms;\n        fetchedRooms.reserve(json.size());\n        for (std::size_t i = 0; i < json.size(); ++i) {\n            auto itemResult = json.get(i);\n            if (!itemResult.isOk()) continue;\n            auto item = itemResult.unwrap();\n            BrowserRoomInfo room;\n            room.roomCode = item.get<std::string>("roomCode").unwrapOr("");\n            room.roomName = item.get<std::string>("roomName").unwrapOr("Untitled Room");\n            room.description = item.get<std::string>("description").unwrapOr("");\n            room.hostName = item.get<std::string>("hostName").unwrapOr("Host");\n            room.playerCount = item.get<int>("playerCount").unwrapOr(1);\n            room.playerLimit = item.get<int>("playerLimit").unwrapOr(8);\n            room.hasPassword = item.get<bool>("hasPassword").unwrapOr(false);\n            room.transportMode = item.get<std::string>("transportMode").unwrapOr("auto");\n            if (!room.roomCode.empty()) fetchedRooms.push_back(std::move(room));\n        }\n\n        m_rooms = std::move(fetchedRooms);\n        m_hasLoadedOnce = true;\n        rebuild();\n    });\n}\n''',
+              'room browser auto refresh implementation'
+          )
+          path.write_text(text, encoding="utf-8")
+
+      - name: Validate fixes
+        run: |
+          grep -F 'const HOST_DIRECTORY_STALE_MS = 45_000;' server/signaling/server.ts
+          grep -F 'directoryNow - room.host.lastSeenAt <= HOST_DIRECTORY_STALE_MS' server/signaling/server.ts
+          grep -F 'void autoRefresh(float);' src/ui/RoomDiscoveryPopups.hpp
+          grep -F 'm_requestInFlight' src/ui/RoomDiscoveryPopups.hpp
+          grep -F 'schedule_selector(RoomBrowserPopup::autoRefresh), 4.f' src/ui/RoomDiscoveryPopups.cpp
+          grep -F 'std::vector<BrowserRoomInfo> fetchedRooms;' src/ui/RoomDiscoveryPopups.cpp
+          deno check server/signaling/server.ts
+
+      - name: Commit fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/signaling/server.ts src/ui/RoomDiscoveryPopups.hpp src/ui/RoomDiscoveryPopups.cpp
+          git commit -m "fix: remove stale public rooms [stale-room-fix-applied]"
+          git push origin HEAD:ui-layout-polish

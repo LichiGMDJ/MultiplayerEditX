@@ -1,0 +1,1 @@
+Trigger stale public-room cleanup and live directory refresh.

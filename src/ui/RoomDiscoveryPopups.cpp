@@ -248,38 +248,60 @@ bool RoomBrowserPopup::setup() {
     m_body = CCNode::create();
     m_mainLayer->addChild(m_body);
     fetchRooms();
+
+    // Keep the directory live while the popup is open. A room that was deleted
+    // by its host disappears without closing/reopening the browser.
+    this->schedule(schedule_selector(RoomBrowserPopup::autoRefresh), 4.f);
     return true;
 }
 
-void RoomBrowserPopup::fetchRooms() {
-    if (!m_body) return;
-    m_rooms.clear();
-    m_page = 0;
-    m_body->removeAllChildren();
+void RoomBrowserPopup::autoRefresh(float) {
+    fetchRooms();
+}
 
-    auto center = m_mainLayer->getContentSize() / 2.f;
-    m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);
+void RoomBrowserPopup::fetchRooms() {
+    if (!m_body || m_requestInFlight) return;
+    m_requestInFlight = true;
+
+    if (!m_hasLoadedOnce) {
+        m_rooms.clear();
+        m_page = 0;
+        m_body->removeAllChildren();
+        auto center = m_mainLayer->getContentSize() / 2.f;
+        m_statusLabel = makeLabel("Loading rooms...", 0.45f, center, m_body);
+    }
 
     auto url = P2PManager::getSignalingUrl() + "/rooms";
     auto req = web::WebRequest();
     req.timeout(std::chrono::seconds(10));
     m_request.spawn(req.get(url), [this, url](web::WebResponse res) {
+        m_requestInFlight = false;
         if (!m_body) return;
+
         if (!res.ok()) {
             log::warn("RoomBrowserPopup: GET {} failed code={} error={}", url, res.code(), res.errorMessage());
-            m_body->removeAllChildren();
-            m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);
-            m_statusLabel->setColor({255, 120, 120});
+            // Do not wipe a valid directory because one background refresh
+            // briefly failed. Only the initial load shows an error state.
+            if (!m_hasLoadedOnce) {
+                m_body->removeAllChildren();
+                m_statusLabel = makeLabel("Could not load rooms", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);
+                m_statusLabel->setColor({255, 120, 120});
+            }
             return;
         }
 
         auto json = res.json().unwrapOr(matjson::Value());
         if (!json.isArray()) {
-            m_body->removeAllChildren();
-            m_statusLabel = makeLabel("Invalid server response", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);
+            log::warn("RoomBrowserPopup: GET {} returned invalid directory payload", url);
+            if (!m_hasLoadedOnce) {
+                m_body->removeAllChildren();
+                m_statusLabel = makeLabel("Invalid server response", 0.45f, m_mainLayer->getContentSize() / 2.f, m_body);
+            }
             return;
         }
 
+        std::vector<BrowserRoomInfo> fetchedRooms;
+        fetchedRooms.reserve(json.size());
         for (std::size_t i = 0; i < json.size(); ++i) {
             auto itemResult = json.get(i);
             if (!itemResult.isOk()) continue;
@@ -293,8 +315,11 @@ void RoomBrowserPopup::fetchRooms() {
             room.playerLimit = item.get<int>("playerLimit").unwrapOr(8);
             room.hasPassword = item.get<bool>("hasPassword").unwrapOr(false);
             room.transportMode = item.get<std::string>("transportMode").unwrapOr("auto");
-            if (!room.roomCode.empty()) m_rooms.push_back(std::move(room));
+            if (!room.roomCode.empty()) fetchedRooms.push_back(std::move(room));
         }
+
+        m_rooms = std::move(fetchedRooms);
+        m_hasLoadedOnce = true;
         rebuild();
     });
 }

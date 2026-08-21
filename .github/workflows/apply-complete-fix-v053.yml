@@ -1,0 +1,43 @@
+name: Apply complete v0.5.3 test fix
+
+on:
+  push:
+    branches:
+      - complete-fix-v053-test
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: complete-fix-v053-test
+
+      - name: Apply surgical patch
+        run: python .ci/complete_fix_v053.py
+
+      - name: Verify patch shape
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/P2PManager.cpp').read_text()
+          ui = Path('src/ui/MultiplayerPopup.cpp').read_text()
+          assert 'sendHttpRelayCursorPacket' in p
+          assert 'transientUnreliable' in p
+          assert 'center.height + 18.f' in ui
+          assert 'center.height - 31.f' in ui
+          print('surgical checks passed')
+          PY
+
+      - name: Commit patched source and remove temporary CI files
+        shell: bash
+        run: |
+          rm -f .ci/complete_fix_v053.py .github/workflows/apply-complete-fix-v053.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: complete room UI and HTTP relay cursor delivery"
+          git push origin HEAD:complete-fix-v053-test
